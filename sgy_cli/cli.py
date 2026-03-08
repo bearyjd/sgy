@@ -35,6 +35,7 @@ SGY_DIR = Path.home() / ".sgy"
 CONFIG_PATH = SGY_DIR / "config.json"
 ENV_PATH = SGY_DIR / ".env"
 SESSION_PATH = SGY_DIR / "session.json"
+EMBED_CACHE_PATH = SGY_DIR / "embed_cache.json"
 
 DEFAULT_BASE_URL = "https://app.schoology.com"
 DEFAULT_SCHOOL_NID = ""
@@ -780,6 +781,296 @@ def _scrape_course_grade_detail(sgy: SchoologySession, section_id: str) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Pages scraper (course materials → pages with embedded Google Slides/Docs)
+# ---------------------------------------------------------------------------
+
+def _load_embed_cache() -> dict:
+    if EMBED_CACHE_PATH.exists():
+        try:
+            return json.loads(EMBED_CACHE_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _save_embed_cache(cache: dict):
+    _ensure_dir()
+    EMBED_CACHE_PATH.write_text(json.dumps(cache, indent=2))
+
+
+def _discover_page_embeds(sgy: SchoologySession, page_id: str, sid: str, child_uid: str = "") -> list:
+    """Warm up session via course preview, then fetch /page/{id} for embed URLs.
+
+    Schoology returns 403 on /page/{id} unless the session has first visited
+    /course/{sid}/preview/{uid}/parent, which sets a server-side auth context.
+    """
+    if not child_uid:
+        return []
+
+    _log(f"    Discovering embeds via preview warmup...", sgy.verbose)
+    sgy._request("GET", f"{sgy.base_url}/course/{sid}/preview/{child_uid}/parent", timeout=15)
+
+    r = sgy._request("GET", f"{sgy.base_url}/page/{page_id}", timeout=15)
+    if r.status_code != 200:
+        return []
+
+    return _extract_google_embed_urls(r.text)
+
+
+def _extract_google_embed_urls(html: str) -> list:
+    if not html:
+        return []
+    urls = []
+    for pattern in [
+        r'docs\.google\.com/presentation/d/[a-zA-Z0-9_-]+[^"\'<>\s]*',
+        r'docs\.google\.com/document/d/[a-zA-Z0-9_-]+[^"\'<>\s]*',
+    ]:
+        for match in re.finditer(pattern, html):
+            url = "https://" + match.group(0)
+            if url not in urls:
+                urls.append(url)
+    return urls
+
+
+def _extract_google_id_and_type(url: str) -> tuple:
+    """Returns (doc_id, type) where type is 'slides' or 'docs'."""
+    m = re.search(r"docs\.google\.com/(presentation|document)/d/([a-zA-Z0-9_-]+)", url)
+    if m:
+        kind = "slides" if m.group(1) == "presentation" else "docs"
+        return m.group(2), kind
+    return None, None
+
+
+def _fetch_google_content_text(url: str) -> Optional[str]:
+    """Fetch text from a Google Slides or Docs URL via export."""
+    doc_id, kind = _extract_google_id_and_type(url)
+    if not doc_id:
+        return None
+
+    s = requests.Session()
+    s.headers["User-Agent"] = DEFAULT_UA
+
+    if kind == "slides":
+        export_url = f"https://docs.google.com/presentation/d/{doc_id}/export/txt"
+    else:
+        export_url = f"https://docs.google.com/document/d/{doc_id}/export?format=txt"
+
+    try:
+        r = s.get(export_url, timeout=15, allow_redirects=True)
+        if r.status_code == 200 and len(r.text.strip()) > 0:
+            ct = r.headers.get("Content-Type", "")
+            if "text/plain" in ct or not ct.startswith("text/html"):
+                return r.text.strip()
+    except requests.RequestException:
+        pass
+
+    for suffix in ["/pub", "/preview"]:
+        if kind == "slides":
+            fallback_url = f"https://docs.google.com/presentation/d/{doc_id}{suffix}"
+        else:
+            fallback_url = f"https://docs.google.com/document/d/{doc_id}{suffix}"
+        try:
+            r = s.get(fallback_url, timeout=15, allow_redirects=True)
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, "html.parser")
+                body = soup.find("body")
+                if body:
+                    text = body.get_text(separator="\n", strip=True)
+                    if len(text) > 50:
+                        return text
+        except requests.RequestException:
+            pass
+
+    return None
+
+
+def _get_page_ids_from_folder_api(sgy: SchoologySession, sid: str) -> list:
+    """Use /v1/courses/{sid}/folder/0 to list materials (works with session cookies)."""
+    data = sgy.fetch_json(f"/v1/courses/{sid}/folder/0")
+    if not data or not isinstance(data, dict):
+        return []
+    items = data.get("folder-item", [])
+    if isinstance(items, dict):
+        items = [items]
+    results = []
+    for item in items:
+        item_type = item.get("type", "")
+        if item_type in ("page", "document"):
+            results.append({
+                "id": str(item.get("id", "")),
+                "title": item.get("title", ""),
+                "material_type": item_type,
+                "body": item.get("body", ""),
+            })
+    return results
+
+
+def _get_page_ids_from_html(sgy: SchoologySession, sid: str, child_uid: Optional[str] = None) -> list:
+    """Fallback: parse materials HTML for page links."""
+    params = {}
+    if child_uid:
+        params["child_uid"] = child_uid
+    try:
+        soup = sgy.fetch_page(f"/course/{sid}/materials", params=params or None)
+    except Exception:
+        return []
+    results = []
+    seen = set()
+    for link in soup.select("a[href*='/page/']"):
+        href = str(link.get("href", ""))
+        m = re.search(r"/page/(\d+)", href)
+        if m and m.group(1) not in seen:
+            seen.add(m.group(1))
+            results.append({"id": m.group(1), "title": link.get_text(strip=True), "material_type": "page"})
+    for link in soup.select("a[href*='/materials/link/view/']"):
+        href = str(link.get("href", ""))
+        m = re.search(r"/materials/link/view/(\d+)", href)
+        if m and m.group(1) not in seen:
+            seen.add(m.group(1))
+            results.append({"id": m.group(1), "title": link.get_text(strip=True), "material_type": "document"})
+    return results
+
+
+def _fetch_page_content(sgy: SchoologySession, item_id: str, material_type: str = "page",
+                        sid: str = "", folder_body: str = "",
+                        child_uid: str = "") -> dict:
+    """Fetch a Schoology page or document link and extract embedded Google content."""
+    if material_type == "document" and sid:
+        url = f"{sgy.base_url}/course/{sid}/materials/link/view/{item_id}"
+    elif sid:
+        url = f"{sgy.base_url}/course/{sid}/page/{item_id}"
+    else:
+        url = f"{sgy.base_url}/page/{item_id}"
+
+    r = sgy._request("GET", url, timeout=15)
+
+    html = r.text if r.status_code == 200 else ""
+
+    soup = BeautifulSoup(html, "html.parser") if html else None
+
+    body_text = ""
+    body_el = None
+    if soup:
+        body_el = soup.select_one("#center-top .content, .s-page-body, .page-body")
+        if body_el:
+            body_text = body_el.get_text(separator="\n", strip=True)
+
+    embed_urls = _extract_google_embed_urls(html)
+
+    if not embed_urls and folder_body:
+        embed_urls = _extract_google_embed_urls(folder_body)
+
+    if not embed_urls and material_type == "page" and sid:
+        cache = _load_embed_cache()
+        cache_key = f"page:{item_id}"
+        cached = cache.get(cache_key, [])
+        if cached:
+            _log(f"    Using cached embed URLs for page {item_id}", sgy.verbose)
+            embed_urls = cached
+        else:
+            embed_urls = _discover_page_embeds(sgy, item_id, sid, child_uid)
+            if embed_urls:
+                cache[cache_key] = embed_urls
+                _save_embed_cache(cache)
+
+    return {
+        "body_html": str(body_el) if body_el else "",
+        "body_text": body_text,
+        "embeds": embed_urls,
+    }
+
+
+def scrape_pages(
+    sgy: SchoologySession,
+    child: Optional[dict],
+    course_id: Optional[str] = None,
+    fetch_google_docs: bool = True,
+) -> list:
+    sgy.ensure_logged_in()
+    if child:
+        sgy.switch_to_child(child)
+
+    courses = get_courses_and_grades(sgy, child)
+    if not courses:
+        _log("No courses found.", sgy.verbose)
+        return []
+
+    if course_id:
+        filtered = [
+            c for c in courses
+            if c.get("section_id") == course_id
+            or course_id in c.get("href", "")
+            or course_id in c.get("name", "").lower()
+        ]
+        if filtered:
+            courses = filtered
+        else:
+            _log(f"Course '{course_id}' not found in enrolled courses.", sgy.verbose)
+            courses = [{"name": f"Course {course_id}", "section_id": course_id}]
+
+    child_uid = child.get("uid") if child else None
+    all_pages = []
+
+    for course in courses:
+        sid = course.get("section_id", "")
+        if not sid:
+            continue
+
+        course_name = course.get("name", "")
+        _log(f"Fetching pages for: {course_name} (section {sid})...", sgy.verbose)
+
+        page_refs = _get_page_ids_from_folder_api(sgy, sid)
+        if not page_refs:
+            _log("  Folder API returned no items, trying HTML scrape...", sgy.verbose)
+            page_refs = _get_page_ids_from_html(sgy, sid, child_uid)
+
+        if not page_refs:
+            continue
+
+        for ref in page_refs:
+            item_id = ref["id"]
+            title = ref["title"]
+            material_type = ref.get("material_type", "page")
+            _log(f"  {material_type.title()}: {title} (id {item_id})", sgy.verbose)
+
+            page_data = _fetch_page_content(
+                sgy, item_id, material_type=material_type, sid=sid,
+                folder_body=ref.get("body", ""),
+                child_uid=child_uid or "",
+            )
+
+            google_embeds = []
+            for embed_url in page_data["embeds"]:
+                doc_id, kind = _extract_google_id_and_type(embed_url)
+                entry = {
+                    "url": embed_url,
+                    "doc_id": doc_id or "",
+                    "type": kind or "unknown",
+                    "text": None,
+                }
+                if fetch_google_docs and doc_id:
+                    _log(f"    Fetching {kind}: {doc_id[:25]}...", sgy.verbose)
+                    entry["text"] = _fetch_google_content_text(embed_url)
+                    if entry["text"] is None and material_type == "page":
+                        _log("    Export failed — clearing stale cache entry", sgy.verbose)
+                        cache = _load_embed_cache()
+                        cache.pop(f"page:{item_id}", None)
+                        _save_embed_cache(cache)
+                google_embeds.append(entry)
+
+            all_pages.append({
+                "title": title,
+                "body_text": page_data["body_text"],
+                "course": course_name,
+                "section_id": sid,
+                "page_id": item_id,
+                "google_embeds": google_embeds,
+            })
+
+    return all_pages
+
+
+# ---------------------------------------------------------------------------
 # Announcements / activity feed scraper
 # ---------------------------------------------------------------------------
 
@@ -1034,6 +1325,51 @@ def output_summary(
     output_announcements(announcements, False)
 
 
+def output_pages(pages: list, as_json: bool):
+    if as_json:
+        output = []
+        for p in pages:
+            entry = {
+                "title": p.get("title", ""),
+                "course": p.get("course", ""),
+                "section_id": p.get("section_id", ""),
+                "page_id": p.get("page_id", ""),
+                "body_text": p.get("body_text", ""),
+                "google_embeds": p.get("google_embeds", []),
+            }
+            output.append(entry)
+        print(json.dumps(output, indent=2))
+        return
+    if not pages:
+        print("No pages found.")
+        return
+    for p in pages:
+        course = p.get("course", "")
+        title = p.get("title", "Untitled")
+        body_text = p.get("body_text", "")
+        google_embeds = p.get("google_embeds", [])
+
+        print(f"\n{'=' * 60}")
+        if course:
+            print(f"  [{course}]")
+        print(f"  {title}")
+        print(f"{'=' * 60}")
+
+        if body_text:
+            print(f"\n{body_text[:1000]}")
+
+        for embed in google_embeds:
+            doc_id = embed.get("doc_id", "unknown")
+            kind = embed.get("type", "unknown")
+            doc_text = embed.get("text")
+            print(f"\n--- Embedded Google {kind.title()} ({doc_id[:30]}) ---")
+            if doc_text:
+                print(doc_text[:2000])
+            else:
+                print(f"  (Could not fetch content. URL: {embed.get('url', '')})")
+    print()
+
+
 # ---------------------------------------------------------------------------
 # CLI commands
 # ---------------------------------------------------------------------------
@@ -1118,7 +1454,6 @@ def cmd_summary(args):
         announcements = scrape_announcements(sgy, child, days=7)
         output_summary(child, children, assignments, grades, announcements, args.json)
     else:
-        # Multi-child: skip per-assignment grade detail to stay fast
         if args.json:
             all_data = {
                 "timestamp": datetime.now().isoformat(),
@@ -1140,6 +1475,21 @@ def cmd_summary(args):
                 grades = scrape_grades(sgy, child, detail=False)
                 announcements = scrape_announcements(sgy, child, days=7)
                 output_summary(child, children, assignments, grades, announcements, False)
+
+
+def cmd_pages(args):
+    sgy = SchoologySession(verbose=not args.json)
+    child = sgy.resolve_child(args.child) if args.child else None
+    if args.child and not child:
+        print(f"Child '{args.child}' not found.", file=sys.stderr)
+        sys.exit(1)
+    pages = scrape_pages(
+        sgy,
+        child,
+        course_id=args.course,
+        fetch_google_docs=not args.no_docs,
+    )
+    output_pages(pages, args.json)
 
 
 # ---------------------------------------------------------------------------
@@ -1181,6 +1531,13 @@ def main():
     sp_sum.add_argument("--child", type=str, help="Child name filter")
     sp_sum.add_argument("--json", action="store_true", help="JSON output")
     sp_sum.set_defaults(func=cmd_summary)
+
+    sp_pages = subparsers.add_parser("pages", help="Course pages (with embedded Google Docs)")
+    sp_pages.add_argument("--child", type=str, help="Child name filter")
+    sp_pages.add_argument("--course", type=str, help="Course/section ID or name substring")
+    sp_pages.add_argument("--no-docs", action="store_true", help="Skip fetching Google Doc content")
+    sp_pages.add_argument("--json", action="store_true", help="JSON output")
+    sp_pages.set_defaults(func=cmd_pages)
 
     args = parser.parse_args()
     if not args.command:
