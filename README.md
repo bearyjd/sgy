@@ -61,7 +61,7 @@ All commands accept `--json` for machine-readable output. `--child` takes a firs
 
 ```bash
 # Human-readable summary for one kid
-sgy summary --child Sam
+sgy summary --child Alex
 
 # JSON dump for all kids (what the cron agent runs)
 sgy summary --json
@@ -89,7 +89,7 @@ You have access to the `sgy` command-line tool to fetch the user's children's sc
 2. **Targeted Assignments Query**
    `sgy assignments --child <FirstName> --days <N> --json`
    - Use when the user asks specifically about homework, tests, or due dates.
-   - Example: `sgy assignments --child Sam --days 7 --json`
+   - Example: `sgy assignments --child Alex --days 7 --json`
 
 3. **Deep-Dive Grades Query (IMPORTANT)**
    `sgy grades --child <FirstName> --detail --json`
