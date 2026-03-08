@@ -16,6 +16,7 @@ Usage:
 import argparse
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -211,10 +212,43 @@ class SchoologySession:
         self._children: Optional[list] = None
         self._current_child_uid: Optional[str] = None
         self._parent_home_soup: Optional[BeautifulSoup] = None
+        self._last_request_time = 0.0
 
         # Derive URLs from config
         self.base_url = self.cfg["base_url"].rstrip("/")
         self.school_nid = self.cfg["school_nid"]
+
+    def _sleep_if_needed(self):
+        """Add jitter/sleep to avoid 429 Too Many Requests."""
+        now = time.time()
+        elapsed = now - self._last_request_time
+        # Want at least ~0.5s to 1.0s between requests
+        target_wait = random.uniform(0.5, 1.2)
+        if elapsed < target_wait:
+            time.sleep(target_wait - elapsed)
+        self._last_request_time = time.time()
+
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Wrapper around requests to add rate limiting and retries."""
+        max_retries = 3
+        base_delay = 2.0
+        r = None
+
+        for attempt in range(max_retries):
+            self._sleep_if_needed()
+            r = self.s.request(method, url, **kwargs)
+            
+            if r.status_code == 429:
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                _log(f"Rate limited (429). Retrying in {delay:.1f}s...", self.verbose)
+                time.sleep(delay)
+                continue
+                
+            return r
+            
+        if r is None:
+            raise RuntimeError("Request failed completely")
+        return r
 
     # -- login / session cache --
 
@@ -226,7 +260,7 @@ class SchoologySession:
         if cached:
             self.s.cookies.update(cached)
             try:
-                r = self.s.get(f"{self.base_url}/home", allow_redirects=False, timeout=15)
+                r = self._request("GET", f"{self.base_url}/home", allow_redirects=False, timeout=15)
                 loc = r.headers.get("Location", "")
                 if r.status_code == 200 or (r.status_code == 302 and "/login" not in loc):
                     self._logged_in = True
@@ -244,7 +278,7 @@ class SchoologySession:
         if self.school_nid:
             login_dest += f"&school={self.school_nid}"
 
-        r = self.s.get(login_dest, timeout=15)
+        r = self._request("GET", login_dest, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
         fbi = soup.find("input", {"name": "form_build_id"})
         if not fbi:
@@ -258,7 +292,7 @@ class SchoologySession:
             "form_id": "s_user_login_form",
             "op": "Log in",
         }
-        r = self.s.post(login_dest, data=payload, allow_redirects=True, timeout=15)
+        r = self._request("POST", login_dest, data=payload, allow_redirects=True, timeout=15)
 
         if "/login" in r.url or "Access denied" in r.text:
             raise RuntimeError("Login failed — check credentials in ~/.sgy/config.json")
@@ -280,7 +314,7 @@ class SchoologySession:
 
         self.ensure_logged_in()
 
-        r = self.s.get(f"{self.base_url}/parent/home", timeout=15)
+        r = self._request("GET", f"{self.base_url}/parent/home", timeout=15)
         self._parent_home_soup = BeautifulSoup(r.text, "html.parser")
         html = r.text
         children = []
@@ -360,7 +394,8 @@ class SchoologySession:
         if self._current_child_uid == uid:
             return
         self.ensure_logged_in()
-        self.s.get(
+        self._request(
+            "GET",
             f"{self.base_url}/parent/home",
             params={"format": "json", "child_uid": uid},
             headers={"X-Requested-With": "XMLHttpRequest"},
@@ -375,14 +410,14 @@ class SchoologySession:
         """Get the parent home page (cached per child switch)."""
         if self._parent_home_soup is None:
             self.ensure_logged_in()
-            r = self.s.get(f"{self.base_url}/parent/home", timeout=15)
+            r = self._request("GET", f"{self.base_url}/parent/home", timeout=15)
             self._parent_home_soup = BeautifulSoup(r.text, "html.parser")
         return self._parent_home_soup
 
     def fetch_page(self, path: str, params: Optional[dict] = None) -> BeautifulSoup:
         """Fetch a page and return parsed soup."""
         self.ensure_logged_in()
-        r = self.s.get(f"{self.base_url}{path}", params=params, timeout=20)
+        r = self._request("GET", f"{self.base_url}{path}", params=params, timeout=20)
         r.raise_for_status()
         return BeautifulSoup(r.text, "html.parser")
 
@@ -390,7 +425,8 @@ class SchoologySession:
         """Fetch JSON from an internal API path."""
         self.ensure_logged_in()
         try:
-            r = self.s.get(
+            r = self._request(
+                "GET",
                 f"{self.base_url}{path}",
                 params=params,
                 headers={
