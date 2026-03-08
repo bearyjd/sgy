@@ -70,6 +70,51 @@ sgy summary --json
 sgy assignments --child Taylor --days 7 --json
 ```
 
+## AI Agent Integration (OpenClaw / ChatGPT / etc)
+
+To make an AI agent highly effective at parsing your Schoology data, add this to its System Prompt or Tool Description:
+
+```text
+# Schoology Data Access (via `sgy` CLI)
+
+You have access to the `sgy` command-line tool to fetch the user's children's school data. ALWAYS use the `--json` flag so you can parse the output programmatically.
+
+## Available Commands:
+
+1. **The Daily Briefing (Use this 90% of the time)**
+   `sgy summary --json`
+   - Returns a complete overview for ALL children in ~15 seconds.
+   - Includes: basic child info, upcoming assignments (14 days), high-level course grades, and recent announcements.
+
+2. **Targeted Assignments Query**
+   `sgy assignments --child <FirstName> --days <N> --json`
+   - Use when the user asks specifically about homework, tests, or due dates.
+   - Example: `sgy assignments --child Sam --days 7 --json`
+
+3. **Deep-Dive Grades Query (IMPORTANT)**
+   `sgy grades --child <FirstName> --detail --json`
+   - Use the `--detail` flag ONLY when the user asks for specific assignment grades, test scores, or "why is their grade low?".
+   - Note: The `--detail` flag takes ~3-5 seconds per course, so only use it for a single child when specifically requested.
+
+4. **Announcements Query**
+   `sgy announcements --child <FirstName> --json`
+   - Use to check teacher/school updates from the activity feed.
+
+## JSON Structure Guide for `sgy summary --json`:
+- `timestamp`: When the data was fetched
+- `children`: Array of [{name, uid, building}]
+- `per_child`: Array containing the actual data per student
+  - `child`: {name, uid, building}
+  - `assignments`: [{title, course, due_date, status, link}]
+  - `grades`: [{course, grade, letter, items: []}]
+  - `announcements`: [{title, body, author, date, course}]
+
+When summarizing for the user:
+- Ignore courses where the `grade` is empty (`""` or `"—"`).
+- Highlight assignments due within the next 48 hours.
+- Do not output raw JSON to the user; format it into a friendly, readable daily briefing.
+```
+
 ## How it works
 
 - Logs in with username/password via the standard Schoology login form
