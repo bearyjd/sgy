@@ -5,8 +5,13 @@ CLI scraper for the Schoology parent portal. Pulls assignments, grades, and anno
 ## Setup
 
 ```bash
-pip install requests beautifulsoup4
-sudo cp sgy /usr/local/bin/sgy
+pip install git+https://github.com/bearyjd/sgy
+```
+
+Or with `--break-system-packages` on system Python:
+
+```bash
+pip install git+https://github.com/bearyjd/sgy --break-system-packages
 ```
 
 Configure credentials (pick one):

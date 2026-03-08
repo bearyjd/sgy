@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 sgy — Schoology parent portal CLI scraper.
 
