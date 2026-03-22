@@ -1251,7 +1251,19 @@ def _get_page_ids_from_folder_api(sgy: SchoologySession, sid: str) -> list:
 
 
 def _get_page_ids_from_html(sgy: SchoologySession, sid: str, child_uid: Optional[str] = None) -> list:
-    """Fallback: parse materials HTML for page links."""
+    """Fallback: parse materials HTML for page links.
+
+    For parent accounts, the materials page may require a preview warmup
+    (visiting /course/{sid}/preview/{uid}/parent first) to set the server-side
+    auth context. Without this, the page may return empty or 403.
+    """
+    # Preview warmup — needed for parent accounts to access course materials
+    if child_uid:
+        try:
+            sgy._request("GET", f"{sgy.base_url}/course/{sid}/preview/{child_uid}/parent", timeout=15)
+        except Exception:
+            pass
+
     params = {}
     if child_uid:
         params["child_uid"] = child_uid
@@ -1835,9 +1847,10 @@ def cmd_announcements(args):
 def _scrape_homework_pages(sgy: SchoologySession, child: Optional[dict]) -> list:
     """Scrape course pages that contain homework content (Google Slides/Docs).
 
-    Calls scrape_pages and filters to items that have Google embeds with text,
-    or whose titles suggest homework content. Returns a simplified list suitable
-    for inclusion in the summary output.
+    Calls scrape_pages and includes any page that has Google embeds with
+    fetchable text content, or whose title suggests homework. This is the
+    primary way homework shows up for teachers who use embedded Google Slides
+    instead of Schoology assignment objects.
     """
     try:
         pages = scrape_pages(sgy, child, fetch_google_docs=True)
@@ -1845,18 +1858,20 @@ def _scrape_homework_pages(sgy: SchoologySession, child: Optional[dict]) -> list
         return []
 
     homework_keywords = {"homework", "hw", "assignment", "weekly", "daily", "practice",
-                         "worksheet", "study guide", "review", "packet"}
+                         "worksheet", "study guide", "review", "packet", "slide"}
 
     results = []
     for p in pages:
         title_lower = p.get("title", "").lower()
         has_google = bool(p.get("google_embeds"))
         has_text = any(e.get("text") for e in p.get("google_embeds", []))
-
-        # Include if it has fetchable Google content, or title looks homework-related
         is_homework = any(kw in title_lower for kw in homework_keywords)
 
-        if has_text or (has_google and is_homework):
+        # Include if:
+        #  - It has Google content we could actually fetch (text available), OR
+        #  - It has a Google embed and the title looks homework-related, OR
+        #  - The title looks homework-related even without embeds (body text may help)
+        if has_text or (has_google and is_homework) or (is_homework and p.get("body_text")):
             results.append({
                 "title": p.get("title", ""),
                 "course": p.get("course", ""),
