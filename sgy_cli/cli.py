@@ -161,10 +161,50 @@ def load_session() -> Optional[dict]:
 
 
 def _parse_date(date_str: str) -> Optional[datetime]:
-    """Try multiple date formats commonly used by Schoology."""
+    """Try multiple date formats commonly used by Schoology.
+
+    Handles ISO dates, US formats, named months, and relative phrases
+    like 'Due tomorrow', 'Overdue by 2 days', 'Due in 3 days'.
+    """
     if not date_str:
         return None
     date_str = date_str.strip()
+
+    # --- Relative date phrases (Schoology uses these in upcoming widgets) ---
+    lower = date_str.lower()
+    now = datetime.now()
+
+    if "today" in lower:
+        return now.replace(hour=23, minute=59, second=0, microsecond=0)
+    if "tomorrow" in lower:
+        return (now + timedelta(days=1)).replace(hour=23, minute=59, second=0, microsecond=0)
+    if "yesterday" in lower:
+        return (now - timedelta(days=1)).replace(hour=23, minute=59, second=0, microsecond=0)
+
+    # "Due in 3 days" / "in 2 days"
+    m_in = re.search(r"in\s+(\d+)\s+day", lower)
+    if m_in:
+        return (now + timedelta(days=int(m_in.group(1)))).replace(hour=23, minute=59, second=0, microsecond=0)
+
+    # "Overdue by 2 days" / "2 days ago"
+    m_ago = re.search(r"(?:overdue\s+by|(\d+)\s+days?\s+ago)", lower)
+    if m_ago:
+        n = re.search(r"(\d+)", lower)
+        if n:
+            return (now - timedelta(days=int(n.group(1)))).replace(hour=23, minute=59, second=0, microsecond=0)
+
+    # "Due Mon", "Due Tuesday" etc. — resolve to next occurrence of that weekday
+    day_names = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    m_day = re.search(r"(?:due\s+)?(mon|tue|wed|thu|fri|sat|sun)\w*", lower)
+    if m_day and not re.search(r"\d", date_str):  # only if no numeric date present
+        target = day_names[m_day.group(1)[:3]]
+        current = now.weekday()
+        delta = (target - current) % 7
+        if delta == 0:
+            delta = 7  # next week if same day
+        return (now + timedelta(days=delta)).replace(hour=23, minute=59, second=0, microsecond=0)
+
+    # --- Absolute date formats ---
     for fmt in (
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%dT%H:%M:%S",
@@ -177,11 +217,23 @@ def _parse_date(date_str: str) -> Optional[datetime]:
         "%b %d, %Y",
         "%B %d, %Y",
         "%b %d, %Y at %I:%M %p",
+        "%B %d, %Y at %I:%M %p",
+        "%b %d",          # "Mar 21" — assume current year
+        "%B %d",          # "March 21"
     ):
         try:
-            return datetime.strptime(date_str, fmt)
+            dt = datetime.strptime(date_str, fmt)
+            # If format had no year, fill in current year
+            if fmt in ("%b %d", "%B %d"):
+                dt = dt.replace(year=now.year)
+                # If that date is >6 months ago, assume next year
+                if (now - dt).days > 180:
+                    dt = dt.replace(year=now.year + 1)
+            return dt
         except ValueError:
             continue
+
+    # Last resort: extract any YYYY-MM-DD substring
     m = re.search(r"(\d{4}-\d{2}-\d{2})", date_str)
     if m:
         try:
@@ -522,43 +574,145 @@ def get_courses_and_grades(sgy: SchoologySession, child: Optional[dict] = None) 
 # Assignments scraper
 # ---------------------------------------------------------------------------
 
+def _dedup_assignments(items: list) -> list:
+    """Deduplicate assignments by normalized title+course or by link.
+
+    When the same assignment appears from multiple sources (AJAX, calendar,
+    folder API, grades page) we keep the richest version — the one with the
+    most non-empty fields.
+    """
+    def _key(a: dict) -> str:
+        link = a.get("link", "").strip().rstrip("/")
+        if link:
+            # Normalize to just the path portion
+            link = re.sub(r"^https?://[^/]+", "", link)
+            return f"link:{link}"
+        title = re.sub(r"\s+", " ", a.get("title", "").strip().lower())
+        course = re.sub(r"\s+", " ", a.get("course", "").strip().lower())
+        return f"tc:{title}|{course}"
+
+    def _richness(a: dict) -> int:
+        """Score how many useful fields this record has."""
+        score = 0
+        for k in ("title", "course", "due_date", "status", "link", "grade"):
+            v = a.get(k, "")
+            if v and v != "unknown":
+                score += 1
+        return score
+
+    best: dict = {}  # key -> assignment
+    for a in items:
+        k = _key(a)
+        if k not in best or _richness(a) > _richness(best[k]):
+            best[k] = a
+    return list(best.values())
+
+
 def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int = 14) -> list:
-    """Scrape upcoming/overdue assignments for a child."""
+    """Scrape upcoming/overdue assignments for a child.
+
+    Runs ALL sources and merges results (no short-circuiting):
+      1. AJAX upcoming submissions endpoint
+      2. Home page upcoming events widget
+      3. Calendar feed (AJAX + iCal)
+      4. Folder API per-course (/v1/courses/{sid}/folder/0)
+      5. Course materials HTML scrape
+      6. Grades page cross-reference (catches graded items not listed elsewhere)
+
+    Results are deduplicated by title+course or link, keeping the richest record.
+    """
     sgy.ensure_logged_in()
     if child:
         sgy.switch_to_child(child)
 
-    assignments = []
+    all_items: list = []
+    source_counts: dict = {}
 
-    # Strategy 1: AJAX endpoint (from schoology-mcp — returns {"html": "..."})
-    data = sgy.fetch_json("/home/upcoming_submissions_ajax")
-    if data and isinstance(data, dict) and data.get("html"):
-        soup = BeautifulSoup(data["html"], "html.parser")
-        assignments.extend(_parse_upcoming_events(soup))
+    # --- Source 1: AJAX upcoming submissions endpoint ---
+    try:
+        data = sgy.fetch_json("/home/upcoming_submissions_ajax")
+        if data and isinstance(data, dict) and data.get("html"):
+            soup = BeautifulSoup(data["html"], "html.parser")
+            found = _parse_upcoming_events(soup)
+            all_items.extend(found)
+            source_counts["ajax_upcoming"] = len(found)
+    except Exception:
+        source_counts["ajax_upcoming"] = 0
 
-    # Strategy 2: The /home page right column (upcoming events widget)
-    if not assignments:
+    # --- Source 2: Home page upcoming events widget ---
+    try:
         soup = sgy.fetch_page("/home")
-        assignments.extend(_parse_upcoming_events(soup))
+        found = _parse_upcoming_events(soup)
+        all_items.extend(found)
+        source_counts["home_widget"] = len(found)
+    except Exception:
+        source_counts["home_widget"] = 0
 
-    # Strategy 3: Scrape individual course materials pages
-    if not assignments:
-        courses = get_courses_and_grades(sgy, child)
-        for course in courses[:10]:
-            sid = course.get("section_id", "")
-            if not sid:
-                continue
-            try:
-                csoup = sgy.fetch_page(f"/course/{sid}/materials")
-                for item in csoup.select(".type-assignment, .material-row"):
-                    a = _parse_material_item(item)
-                    if a:
-                        a["course"] = course.get("name", "")
-                        assignments.append(a)
-            except Exception:
-                continue
+    # --- Source 3: Calendar feed ---
+    try:
+        found = _scrape_calendar_assignments(sgy)
+        all_items.extend(found)
+        source_counts["calendar"] = len(found)
+    except Exception:
+        source_counts["calendar"] = 0
 
-    # Filter by date window
+    # --- Sources 4 & 5: Per-course folder API + materials HTML ---
+    courses = get_courses_and_grades(sgy, child)
+    folder_count = 0
+    materials_count = 0
+    for course in courses[:10]:
+        sid = course.get("section_id", "")
+        if not sid:
+            continue
+        cname = course.get("name", "")
+
+        # Source 4: Folder API — structured list of ALL material types
+        try:
+            found = _get_assignments_from_folder_api(sgy, sid)
+            for a in found:
+                a["course"] = cname
+            all_items.extend(found)
+            folder_count += len(found)
+        except Exception:
+            pass
+
+        # Source 5: Materials HTML scrape (catches UI-rendered items)
+        try:
+            csoup = sgy.fetch_page(f"/course/{sid}/materials")
+            for item in csoup.select(".type-assignment, .type-discussion, .type-assessment, .material-row"):
+                a = _parse_material_item(item)
+                if a:
+                    a["course"] = cname
+                    all_items.append(a)
+                    materials_count += 1
+        except Exception:
+            continue
+
+    source_counts["folder_api"] = folder_count
+    source_counts["materials_html"] = materials_count
+
+    # --- Source 6: Grades page cross-reference ---
+    grades_count = 0
+    for course in courses[:10]:
+        sid = course.get("section_id", "")
+        if not sid:
+            continue
+        cname = course.get("name", "")
+        try:
+            found = _get_assignments_from_grades(sgy, sid)
+            for a in found:
+                a["course"] = cname
+            all_items.extend(found)
+            grades_count += len(found)
+        except Exception:
+            continue
+    source_counts["grades_xref"] = grades_count
+
+    # --- Deduplicate ---
+    before_dedup = len(all_items)
+    assignments = _dedup_assignments(all_items)
+
+    # --- Filter by date window ---
     if days and assignments:
         now = datetime.now()
         cutoff_future = now + timedelta(days=days)
@@ -570,10 +724,201 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
                 if cutoff_past <= dt <= cutoff_future:
                     filtered.append(a)
             else:
+                # Keep items with no parseable date (better to show than to hide)
                 filtered.append(a)
         assignments = filtered
 
+    # --- Debug summary ---
+    _log(
+        f"Assignment sources: {source_counts} | "
+        f"raw={before_dedup} deduped={len(_dedup_assignments(all_items))} "
+        f"after_date_filter={len(assignments)}",
+        sgy.verbose,
+    )
+
     return assignments
+
+
+def _scrape_calendar_assignments(sgy: SchoologySession) -> list:
+    """Scrape assignments from Schoology's calendar feed.
+
+    Tries multiple calendar endpoints that aggregate due dates across all
+    assignment types (including those without online submission).
+    """
+    results = []
+
+    # Strategy A: Calendar upcoming AJAX (mirrors the calendar widget)
+    try:
+        now = datetime.now()
+        start = now - timedelta(days=7)
+        end = now + timedelta(days=30)
+        data = sgy.fetch_json(
+            "/calendar/feed_ajax/upcoming",
+            params={
+                "start": start.strftime("%Y-%m-%d"),
+                "end": end.strftime("%Y-%m-%d"),
+            },
+        )
+        if data and isinstance(data, list):
+            for event in data:
+                title = event.get("title", "").strip()
+                if not title:
+                    continue
+                results.append({
+                    "title": title,
+                    "course": event.get("course_title", "") or event.get("realm_title", ""),
+                    "due_date": event.get("start", "") or event.get("end", ""),
+                    "status": "unknown",
+                    "link": event.get("url", "") or event.get("link", ""),
+                })
+    except Exception:
+        pass
+
+    # Strategy B: Calendar feed AJAX (full events range)
+    if not results:
+        try:
+            now = datetime.now()
+            start = now - timedelta(days=7)
+            end = now + timedelta(days=30)
+            data = sgy.fetch_json(
+                "/calendar/feed_ajax",
+                params={
+                    "start": int(start.timestamp()),
+                    "end": int(end.timestamp()),
+                },
+            )
+            if data and isinstance(data, list):
+                for event in data:
+                    title = event.get("title", "").strip()
+                    if not title:
+                        continue
+                    # Calendar events include meetings, so filter to assignment-like items
+                    etype = event.get("type", "").lower()
+                    if etype and etype not in ("assignment", "event", "assessment", "discussion", ""):
+                        continue
+                    results.append({
+                        "title": title,
+                        "course": event.get("course_title", "") or event.get("realm_title", ""),
+                        "due_date": event.get("start", "") or event.get("end", ""),
+                        "status": "unknown",
+                        "link": event.get("url", "") or event.get("link", ""),
+                    })
+        except Exception:
+            pass
+
+    return results
+
+
+def _get_assignments_from_folder_api(sgy: SchoologySession, sid: str) -> list:
+    """Use /v1/courses/{sid}/folder/0 to find assignments, discussions, and assessments.
+
+    The folder API returns structured items with a 'type' field. Unlike the pages
+    scraper which only collects 'page' and 'document', this collects assignment-like types.
+    """
+    data = sgy.fetch_json(f"/v1/courses/{sid}/folder/0")
+    if not data or not isinstance(data, dict):
+        return []
+
+    items = data.get("folder-item", [])
+    if isinstance(items, dict):
+        items = [items]
+
+    results = []
+    assignment_types = {"assignment", "discussion", "assessment", "quiz", "test"}
+
+    for item in items:
+        item_type = item.get("type", "").lower()
+        if item_type not in assignment_types:
+            continue
+        title = item.get("title", "").strip()
+        if not title:
+            continue
+
+        due = item.get("due", "") or item.get("due_date", "")
+        link = ""
+        item_id = item.get("id", "")
+        if item_id:
+            link = f"/course/{sid}/{item_type}/{item_id}"
+
+        results.append({
+            "title": title,
+            "course": "",
+            "due_date": due,
+            "status": "unknown",
+            "link": link,
+        })
+
+    return results
+
+
+def _get_assignments_from_grades(sgy: SchoologySession, sid: str) -> list:
+    """Extract assignment names from the grades page as a cross-reference.
+
+    Any item that has a grade entry is an assignment the student should know about.
+    Items that appear here but not in other sources are homework we'd otherwise miss.
+    """
+    try:
+        soup = sgy.fetch_page(f"/course/{sid}/student_grades")
+    except Exception:
+        return []
+
+    grade_table = soup.find("table", {"role": "presentation"})
+    if not grade_table:
+        return []
+
+    results = []
+    for tr in grade_table.select("tr.report-row"):
+        classes = tr.get("class", [])
+        if "course-row" in classes or "period-row" in classes or "category-row" in classes:
+            continue
+
+        title_td = tr.select_one("td.title-column")
+        if not title_td:
+            continue
+
+        title_el = title_td.select_one("a.sExtlink-processed, a, .title")
+        name = title_el.get_text(strip=True) if title_el else title_td.get_text(strip=True)
+        if not name or name == "Category":
+            continue
+
+        link = ""
+        if title_el and title_el.name == "a":
+            link = title_el.get("href", "")
+
+        due_el = title_td.select_one(".due-date, .due")
+        due = due_el.get_text(strip=True) if due_el else ""
+
+        grade_td = tr.select_one("td.grade-column")
+        grade_text = ""
+        if grade_td:
+            rounded = grade_td.select_one(".rounded-grade")
+            if rounded:
+                grade_text = rounded.get_text(strip=True)
+            else:
+                grade_text = grade_td.get_text(strip=True)
+            if grade_text in ("—", "-"):
+                grade_text = ""
+
+        # Determine status from grade
+        status = "unknown"
+        if grade_text:
+            status = "graded"
+        else:
+            # No grade could mean missing, upcoming, or excused
+            exception_el = tr.select_one(".exception-text, .exception")
+            if exception_el:
+                status = exception_el.get_text(strip=True).lower()
+
+        results.append({
+            "title": name,
+            "course": "",
+            "due_date": due,
+            "status": status,
+            "link": link,
+            "grade": grade_text,
+        })
+
+    return results
 
 
 def _parse_upcoming_events(soup: BeautifulSoup) -> list:
