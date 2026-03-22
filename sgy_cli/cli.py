@@ -1711,12 +1711,7 @@ def _output_homework_pages(pages: list):
         for embed in p.get("google_embeds", []):
             text = embed.get("text", "")
             if text:
-                # Show first ~500 chars of the slide/doc content
-                preview = text[:500]
-                if len(text) > 500:
-                    preview += "..."
-                # Indent the content
-                for line in preview.split("\n"):
+                for line in text.split("\n"):
                     line = line.strip()
                     if line:
                         print(f"    {line}")
@@ -1726,10 +1721,7 @@ def _output_homework_pages(pages: list):
 
         # If no embeds, show body text
         if not p.get("google_embeds") and p.get("body_text"):
-            body = p["body_text"][:500]
-            if len(p["body_text"]) > 500:
-                body += "..."
-            for line in body.split("\n"):
+            for line in p["body_text"].split("\n"):
                 line = line.strip()
                 if line:
                     print(f"    {line}")
