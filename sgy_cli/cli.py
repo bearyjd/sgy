@@ -1638,6 +1638,7 @@ def output_summary(
     grades: list,
     announcements: list,
     as_json: bool,
+    homework_pages: Optional[list] = None,
 ):
     if as_json:
         data = {
@@ -1648,6 +1649,8 @@ def output_summary(
             "grades": grades,
             "announcements": announcements,
         }
+        if homework_pages:
+            data["homework_pages"] = homework_pages
         print(json.dumps(data, indent=2))
         return
 
@@ -1663,11 +1666,55 @@ def output_summary(
     print("\n--- Assignments ---")
     output_assignments(assignments, False)
 
+    # Homework pages (Google Slides/Docs embedded in course materials)
+    if homework_pages:
+        print("\n--- Homework Pages (Embedded Slides/Docs) ---")
+        _output_homework_pages(homework_pages)
+
     print("\n--- Grades ---")
     output_grades(grades, False)
 
     print("\n--- Announcements ---")
     output_announcements(announcements, False)
+
+
+def _output_homework_pages(pages: list):
+    """Display homework pages with their embedded Google content."""
+    if not pages:
+        print("No homework pages found.")
+        return
+    for p in pages:
+        course = p.get("course", "")
+        title = p.get("title", "")
+        print(f"\n  [{course}] {title}")
+
+        # Show embedded Google content (the actual homework)
+        for embed in p.get("google_embeds", []):
+            text = embed.get("text", "")
+            if text:
+                # Show first ~500 chars of the slide/doc content
+                preview = text[:500]
+                if len(text) > 500:
+                    preview += "..."
+                # Indent the content
+                for line in preview.split("\n"):
+                    line = line.strip()
+                    if line:
+                        print(f"    {line}")
+            else:
+                url = embed.get("url", "")
+                print(f"    (embed: {url})")
+
+        # If no embeds, show body text
+        if not p.get("google_embeds") and p.get("body_text"):
+            body = p["body_text"][:500]
+            if len(p["body_text"]) > 500:
+                body += "..."
+            for line in body.split("\n"):
+                line = line.strip()
+                if line:
+                    print(f"    {line}")
+    print()
 
 
 def output_pages(pages: list, as_json: bool):
@@ -1785,6 +1832,49 @@ def cmd_announcements(args):
     output_announcements(announcements, args.json)
 
 
+def _scrape_homework_pages(sgy: SchoologySession, child: Optional[dict]) -> list:
+    """Scrape course pages that contain homework content (Google Slides/Docs).
+
+    Calls scrape_pages and filters to items that have Google embeds with text,
+    or whose titles suggest homework content. Returns a simplified list suitable
+    for inclusion in the summary output.
+    """
+    try:
+        pages = scrape_pages(sgy, child, fetch_google_docs=True)
+    except Exception:
+        return []
+
+    homework_keywords = {"homework", "hw", "assignment", "weekly", "daily", "practice",
+                         "worksheet", "study guide", "review", "packet"}
+
+    results = []
+    for p in pages:
+        title_lower = p.get("title", "").lower()
+        has_google = bool(p.get("google_embeds"))
+        has_text = any(e.get("text") for e in p.get("google_embeds", []))
+
+        # Include if it has fetchable Google content, or title looks homework-related
+        is_homework = any(kw in title_lower for kw in homework_keywords)
+
+        if has_text or (has_google and is_homework):
+            results.append({
+                "title": p.get("title", ""),
+                "course": p.get("course", ""),
+                "page_id": p.get("page_id", ""),
+                "body_text": p.get("body_text", ""),
+                "google_embeds": [
+                    {
+                        "url": e.get("url", ""),
+                        "type": e.get("type", ""),
+                        "text": e.get("text", ""),
+                    }
+                    for e in p.get("google_embeds", [])
+                ],
+            })
+
+    return results
+
+
 def cmd_summary(args):
     sgy = SchoologySession(verbose=not args.json)
     children = sgy.get_children()
@@ -1797,7 +1887,9 @@ def cmd_summary(args):
         assignments = scrape_assignments(sgy, child, days=14)
         grades = scrape_grades(sgy, child, detail=True)
         announcements = scrape_announcements(sgy, child, days=7)
-        output_summary(child, children, assignments, grades, announcements, args.json)
+        homework_pages = _scrape_homework_pages(sgy, child)
+        output_summary(child, children, assignments, grades, announcements, args.json,
+                        homework_pages=homework_pages)
     else:
         if args.json:
             all_data = {
@@ -1812,6 +1904,7 @@ def cmd_summary(args):
                     "assignments": scrape_assignments(sgy, child, days=14),
                     "grades": scrape_grades(sgy, child, detail=False),
                     "announcements": scrape_announcements(sgy, child, days=7),
+                    "homework_pages": _scrape_homework_pages(sgy, child),
                 })
             print(json.dumps(all_data, indent=2))
         else:
@@ -1819,7 +1912,9 @@ def cmd_summary(args):
                 assignments = scrape_assignments(sgy, child, days=14)
                 grades = scrape_grades(sgy, child, detail=False)
                 announcements = scrape_announcements(sgy, child, days=7)
-                output_summary(child, children, assignments, grades, announcements, False)
+                homework_pages = _scrape_homework_pages(sgy, child)
+                output_summary(child, children, assignments, grades, announcements, False,
+                                homework_pages=homework_pages)
 
 
 def cmd_pages(args):
