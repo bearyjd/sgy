@@ -1292,6 +1292,13 @@ def _fetch_page_content(sgy: SchoologySession, item_id: str, material_type: str 
                         sid: str = "", folder_body: str = "",
                         child_uid: str = "") -> dict:
     """Fetch a Schoology page or document link and extract embedded Google content."""
+    # Preview warmup — parent accounts need this before accessing course content
+    if child_uid and sid:
+        try:
+            sgy._request("GET", f"{sgy.base_url}/course/{sid}/preview/{child_uid}/parent", timeout=15)
+        except Exception:
+            pass
+
     if material_type == "document" and sid:
         url = f"{sgy.base_url}/course/{sid}/materials/link/view/{item_id}"
     elif sid:
@@ -1844,19 +1851,14 @@ def cmd_announcements(args):
     output_announcements(announcements, args.json)
 
 
-def _scrape_homework_pages(sgy: SchoologySession, child: Optional[dict]) -> list:
-    """Scrape course pages that contain homework content (Google Slides/Docs).
+def _filter_homework_pages(pages: list) -> list:
+    """Filter scraped pages to those containing homework content.
 
-    Calls scrape_pages and includes any page that has Google embeds with
-    fetchable text content, or whose title suggests homework. This is the
-    primary way homework shows up for teachers who use embedded Google Slides
-    instead of Schoology assignment objects.
+    Includes any page that has Google embeds with fetchable text content,
+    or whose title suggests homework. This is the primary way homework
+    shows up for teachers who use embedded Google Slides instead of
+    Schoology assignment objects.
     """
-    try:
-        pages = scrape_pages(sgy, child, fetch_google_docs=True)
-    except Exception:
-        return []
-
     homework_keywords = {"homework", "hw", "assignment", "weekly", "daily", "practice",
                          "worksheet", "study guide", "review", "packet", "slide"}
 
@@ -1902,7 +1904,8 @@ def cmd_summary(args):
         assignments = scrape_assignments(sgy, child, days=14)
         grades = scrape_grades(sgy, child, detail=True)
         announcements = scrape_announcements(sgy, child, days=7)
-        homework_pages = _scrape_homework_pages(sgy, child)
+        pages = scrape_pages(sgy, child, fetch_google_docs=True)
+        homework_pages = _filter_homework_pages(pages)
         output_summary(child, children, assignments, grades, announcements, args.json,
                         homework_pages=homework_pages)
     else:
@@ -1914,12 +1917,13 @@ def cmd_summary(args):
             }
             for child in children:
                 sgy.switch_to_child(child)
+                pages = scrape_pages(sgy, child, fetch_google_docs=True)
                 all_data["per_child"].append({
                     "child": child,
                     "assignments": scrape_assignments(sgy, child, days=14),
                     "grades": scrape_grades(sgy, child, detail=False),
                     "announcements": scrape_announcements(sgy, child, days=7),
-                    "homework_pages": _scrape_homework_pages(sgy, child),
+                    "homework_pages": _filter_homework_pages(pages),
                 })
             print(json.dumps(all_data, indent=2))
         else:
@@ -1927,7 +1931,8 @@ def cmd_summary(args):
                 assignments = scrape_assignments(sgy, child, days=14)
                 grades = scrape_grades(sgy, child, detail=False)
                 announcements = scrape_announcements(sgy, child, days=7)
-                homework_pages = _scrape_homework_pages(sgy, child)
+                pages = scrape_pages(sgy, child, fetch_google_docs=True)
+                homework_pages = _filter_homework_pages(pages)
                 output_summary(child, children, assignments, grades, announcements, False,
                                 homework_pages=homework_pages)
 
