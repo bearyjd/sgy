@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import getpass
 import json
 import os
 import random
@@ -138,9 +139,14 @@ def save_config(cfg: dict):
     os.chmod(CONFIG_PATH, 0o600)
 
 
-def save_session(cookies: dict):
+def save_session(cookies_jar):
+    """Save session cookies with full metadata (domain, path)."""
     _ensure_dir()
-    data = {"cookies": cookies, "ts": time.time()}
+    cookie_list = [
+        {"name": c.name, "value": c.value, "domain": c.domain, "path": c.path}
+        for c in cookies_jar
+    ]
+    data = {"cookies": cookie_list, "ts": time.time()}
     with open(SESSION_PATH, "w") as f:
         json.dump(data, f)
     os.chmod(SESSION_PATH, 0o600)
@@ -186,12 +192,15 @@ def _parse_date(date_str: str) -> Optional[datetime]:
     if m_in:
         return (now + timedelta(days=int(m_in.group(1)))).replace(hour=23, minute=59, second=0, microsecond=0)
 
-    # "Overdue by 2 days" / "2 days ago"
-    m_ago = re.search(r"(?:overdue\s+by|(\d+)\s+days?\s+ago)", lower)
+    # "Overdue by 2 days"
+    m_overdue = re.search(r"overdue\s+by\s+(\d+)\s+day", lower)
+    if m_overdue:
+        return (now - timedelta(days=int(m_overdue.group(1)))).replace(hour=23, minute=59, second=0, microsecond=0)
+
+    # "2 days ago"
+    m_ago = re.search(r"(\d+)\s+days?\s+ago", lower)
     if m_ago:
-        n = re.search(r"(\d+)", lower)
-        if n:
-            return (now - timedelta(days=int(n.group(1)))).replace(hour=23, minute=59, second=0, microsecond=0)
+        return (now - timedelta(days=int(m_ago.group(1)))).replace(hour=23, minute=59, second=0, microsecond=0)
 
     # "Due Mon", "Due Tuesday" etc. — resolve to next occurrence of that weekday
     day_names = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
@@ -261,11 +270,13 @@ class SchoologySession:
         self.s.headers.update({"User-Agent": DEFAULT_UA})
         self.cfg = load_config()
         self.verbose = verbose
+        self.warnings: list = []
         self._logged_in = False
         self._children: Optional[list] = None
         self._current_child_uid: Optional[str] = None
         self._parent_home_soup: Optional[BeautifulSoup] = None
         self._last_request_time = 0.0
+        self._folder_cache: dict = {}
 
         # Derive URLs from config
         self.base_url = self.cfg["base_url"].rstrip("/")
@@ -311,7 +322,12 @@ class SchoologySession:
 
         cached = load_session()
         if cached:
-            self.s.cookies.update(cached)
+            if isinstance(cached, list):
+                for c in cached:
+                    self.s.cookies.set(c["name"], c["value"],
+                                       domain=c.get("domain", ""), path=c.get("path", "/"))
+            elif isinstance(cached, dict):
+                self.s.cookies.update(cached)
             try:
                 r = self._request("GET", f"{self.base_url}/home", allow_redirects=False, timeout=15)
                 loc = r.headers.get("Location", "")
@@ -322,7 +338,12 @@ class SchoologySession:
             except requests.RequestException:
                 pass
 
-        self._do_login()
+        try:
+            self._do_login()
+        except RuntimeError:
+            _log("Login failed, retrying in 3s...", self.verbose)
+            time.sleep(3)
+            self._do_login()
 
     def _do_login(self):
         _log("Logging in to Schoology...", self.verbose)
@@ -351,7 +372,7 @@ class SchoologySession:
             raise RuntimeError("Login failed — check credentials in ~/.sgy/config.json")
 
         self._logged_in = True
-        save_session(dict(self.s.cookies))
+        save_session(self.s.cookies)
         _log("Login successful.", self.verbose)
 
     # -- child discovery --
@@ -491,8 +512,17 @@ class SchoologySession:
             if r.status_code != 200:
                 return None
             return r.json()
-        except Exception:
+        except Exception as exc:
+            _log(f"  [warn] fetch_json({path}) failed: {exc}", self.verbose)
             return None
+
+    def get_folder(self, sid: str) -> Optional[dict]:
+        """Fetch folder API with per-session caching."""
+        if sid in self._folder_cache:
+            return self._folder_cache[sid]
+        data = self.fetch_json(f"/v1/courses/{sid}/folder/0")
+        self._folder_cache[sid] = data
+        return data
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +666,9 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
             found = _parse_upcoming_events(soup)
             all_items.extend(found)
             source_counts["ajax_upcoming"] = len(found)
-    except Exception:
+    except Exception as exc:
+        _log(f"  [warn] ajax_upcoming failed: {exc}", sgy.verbose)
+        sgy.warnings.append(f"ajax_upcoming: {exc}")
         source_counts["ajax_upcoming"] = 0
 
     # --- Source 2: Home page upcoming events widget ---
@@ -645,7 +677,9 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
         found = _parse_upcoming_events(soup)
         all_items.extend(found)
         source_counts["home_widget"] = len(found)
-    except Exception:
+    except Exception as exc:
+        _log(f"  [warn] home_widget failed: {exc}", sgy.verbose)
+        sgy.warnings.append(f"home_widget: {exc}")
         source_counts["home_widget"] = 0
 
     # --- Source 3: Calendar feed ---
@@ -653,14 +687,20 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
         found = _scrape_calendar_assignments(sgy)
         all_items.extend(found)
         source_counts["calendar"] = len(found)
-    except Exception:
+    except Exception as exc:
+        _log(f"  [warn] calendar failed: {exc}", sgy.verbose)
+        sgy.warnings.append(f"calendar: {exc}")
         source_counts["calendar"] = 0
 
     # --- Sources 4 & 5: Per-course folder API + materials HTML ---
     courses = get_courses_and_grades(sgy, child)
+    max_courses = 15
+    if len(courses) > max_courses:
+        _log(f"  [warn] {len(courses)} courses found, limiting to {max_courses}", sgy.verbose)
+        sgy.warnings.append(f"courses_truncated: {len(courses)} courses, showing {max_courses}")
     folder_count = 0
     materials_count = 0
-    for course in courses[:10]:
+    for course in courses[:max_courses]:
         sid = course.get("section_id", "")
         if not sid:
             continue
@@ -673,8 +713,8 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
                 a["course"] = cname
             all_items.extend(found)
             folder_count += len(found)
-        except Exception:
-            pass
+        except Exception as exc:
+            _log(f"  [warn] folder_api({cname}) failed: {exc}", sgy.verbose)
 
         # Source 5: Materials HTML scrape (catches UI-rendered items)
         try:
@@ -685,7 +725,8 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
                     a["course"] = cname
                     all_items.append(a)
                     materials_count += 1
-        except Exception:
+        except Exception as exc:
+            _log(f"  [warn] materials_html({cname}) failed: {exc}", sgy.verbose)
             continue
 
     source_counts["folder_api"] = folder_count
@@ -693,7 +734,7 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
 
     # --- Source 6: Grades page cross-reference ---
     grades_count = 0
-    for course in courses[:10]:
+    for course in courses[:max_courses]:
         sid = course.get("section_id", "")
         if not sid:
             continue
@@ -704,7 +745,8 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
                 a["course"] = cname
             all_items.extend(found)
             grades_count += len(found)
-        except Exception:
+        except Exception as exc:
+            _log(f"  [warn] grades_xref({cname}) failed: {exc}", sgy.verbose)
             continue
     source_counts["grades_xref"] = grades_count
 
@@ -771,8 +813,8 @@ def _scrape_calendar_assignments(sgy: SchoologySession) -> list:
                     "status": "unknown",
                     "link": event.get("url", "") or event.get("link", ""),
                 })
-    except Exception:
-        pass
+    except Exception as exc:
+        _log(f"  [warn] calendar_upcoming failed: {exc}", sgy.verbose)
 
     # Strategy B: Calendar feed AJAX (full events range)
     if not results:
@@ -803,8 +845,8 @@ def _scrape_calendar_assignments(sgy: SchoologySession) -> list:
                         "status": "unknown",
                         "link": event.get("url", "") or event.get("link", ""),
                     })
-        except Exception:
-            pass
+        except Exception as exc:
+            _log(f"  [warn] calendar_feed failed: {exc}", sgy.verbose)
 
     return results
 
@@ -815,7 +857,7 @@ def _get_assignments_from_folder_api(sgy: SchoologySession, sid: str) -> list:
     The folder API returns structured items with a 'type' field. Unlike the pages
     scraper which only collects 'page' and 'document', this collects assignment-like types.
     """
-    data = sgy.fetch_json(f"/v1/courses/{sid}/folder/0")
+    data = sgy.get_folder(sid)
     if not data or not isinstance(data, dict):
         return []
 
@@ -859,7 +901,8 @@ def _get_assignments_from_grades(sgy: SchoologySession, sid: str) -> list:
     """
     try:
         soup = sgy.fetch_page(f"/course/{sid}/student_grades")
-    except Exception:
+    except Exception as exc:
+        _log(f"  [warn] grades page for section {sid} failed: {exc}", sgy.verbose)
         return []
 
     grade_table = soup.find("table", {"role": "presentation"})
@@ -1037,8 +1080,8 @@ def scrape_grades(sgy: SchoologySession, child: Optional[dict], detail: bool = T
                 try:
                     detail_items = _scrape_course_grade_detail(sgy, sid)
                     grade_entry["items"] = detail_items
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log(f"  [warn] grade detail for {course['name']} failed: {exc}", sgy.verbose)
 
         grades.append(grade_entry)
 
@@ -1122,7 +1165,7 @@ def _scrape_course_grade_detail(sgy: SchoologySession, section_id: str) -> list:
             "is_category": is_category,
         })
 
-    return items[:30]
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -1132,7 +1175,13 @@ def _scrape_course_grade_detail(sgy: SchoologySession, section_id: str) -> list:
 def _load_embed_cache() -> dict:
     if EMBED_CACHE_PATH.exists():
         try:
-            return json.loads(EMBED_CACHE_PATH.read_text())
+            raw = json.loads(EMBED_CACHE_PATH.read_text())
+            now = time.time()
+            ttl = 7 * 86400  # 7 days
+            return {
+                k: v for k, v in raw.items()
+                if isinstance(v, dict) and now - v.get("ts", 0) < ttl
+            }
         except (json.JSONDecodeError, OSError):
             pass
     return {}
@@ -1186,14 +1235,15 @@ def _extract_google_id_and_type(url: str) -> tuple:
     return None, None
 
 
-def _fetch_google_content_text(url: str) -> Optional[str]:
+def _fetch_google_content_text(url: str, session: Optional[requests.Session] = None) -> Optional[str]:
     """Fetch text from a Google Slides or Docs URL via export."""
     doc_id, kind = _extract_google_id_and_type(url)
     if not doc_id:
         return None
 
-    s = requests.Session()
-    s.headers["User-Agent"] = DEFAULT_UA
+    if session is None:
+        session = requests.Session()
+        session.headers["User-Agent"] = DEFAULT_UA
 
     if kind == "slides":
         export_url = f"https://docs.google.com/presentation/d/{doc_id}/export/txt"
@@ -1201,7 +1251,8 @@ def _fetch_google_content_text(url: str) -> Optional[str]:
         export_url = f"https://docs.google.com/document/d/{doc_id}/export?format=txt"
 
     try:
-        r = s.get(export_url, timeout=15, allow_redirects=True)
+        time.sleep(random.uniform(0.5, 1.0))
+        r = session.get(export_url, timeout=15, allow_redirects=True)
         if r.status_code == 200 and len(r.text.strip()) > 0:
             ct = r.headers.get("Content-Type", "")
             if "text/plain" in ct or not ct.startswith("text/html"):
@@ -1215,7 +1266,8 @@ def _fetch_google_content_text(url: str) -> Optional[str]:
         else:
             fallback_url = f"https://docs.google.com/document/d/{doc_id}{suffix}"
         try:
-            r = s.get(fallback_url, timeout=15, allow_redirects=True)
+            time.sleep(random.uniform(0.5, 1.0))
+            r = session.get(fallback_url, timeout=15, allow_redirects=True)
             if r.status_code == 200:
                 soup = BeautifulSoup(r.text, "html.parser")
                 body = soup.find("body")
@@ -1231,7 +1283,7 @@ def _fetch_google_content_text(url: str) -> Optional[str]:
 
 def _get_page_ids_from_folder_api(sgy: SchoologySession, sid: str) -> list:
     """Use /v1/courses/{sid}/folder/0 to list materials (works with session cookies)."""
-    data = sgy.fetch_json(f"/v1/courses/{sid}/folder/0")
+    data = sgy.get_folder(sid)
     if not data or not isinstance(data, dict):
         return []
     items = data.get("folder-item", [])
@@ -1261,15 +1313,16 @@ def _get_page_ids_from_html(sgy: SchoologySession, sid: str, child_uid: Optional
     if child_uid:
         try:
             sgy._request("GET", f"{sgy.base_url}/course/{sid}/preview/{child_uid}/parent", timeout=15)
-        except Exception:
-            pass
+        except Exception as exc:
+            _log(f"  [warn] preview warmup failed: {exc}", sgy.verbose)
 
     params = {}
     if child_uid:
         params["child_uid"] = child_uid
     try:
         soup = sgy.fetch_page(f"/course/{sid}/materials", params=params or None)
-    except Exception:
+    except Exception as exc:
+        _log(f"  [warn] materials HTML fetch failed: {exc}", sgy.verbose)
         return []
     results = []
     seen = set()
@@ -1296,8 +1349,8 @@ def _fetch_page_content(sgy: SchoologySession, item_id: str, material_type: str 
     if child_uid and sid:
         try:
             sgy._request("GET", f"{sgy.base_url}/course/{sid}/preview/{child_uid}/parent", timeout=15)
-        except Exception:
-            pass
+        except Exception as exc:
+            _log(f"  [warn] content preview warmup failed: {exc}", sgy.verbose)
 
     if material_type == "document" and sid:
         url = f"{sgy.base_url}/course/{sid}/materials/link/view/{item_id}"
@@ -1327,14 +1380,14 @@ def _fetch_page_content(sgy: SchoologySession, item_id: str, material_type: str 
     if not embed_urls and material_type == "page" and sid:
         cache = _load_embed_cache()
         cache_key = f"page:{item_id}"
-        cached = cache.get(cache_key, [])
+        cached = cache.get(cache_key)
         if cached:
             _log(f"    Using cached embed URLs for page {item_id}", sgy.verbose)
-            embed_urls = cached
+            embed_urls = cached.get("urls", cached) if isinstance(cached, dict) else cached
         else:
             embed_urls = _discover_page_embeds(sgy, item_id, sid, child_uid)
             if embed_urls:
-                cache[cache_key] = embed_urls
+                cache[cache_key] = {"urls": embed_urls, "ts": time.time()}
                 _save_embed_cache(cache)
 
     return {
@@ -1414,7 +1467,7 @@ def scrape_pages(
                 }
                 if fetch_google_docs and doc_id:
                     _log(f"    Fetching {kind}: {doc_id[:25]}...", sgy.verbose)
-                    entry["text"] = _fetch_google_content_text(embed_url)
+                    entry["text"] = _fetch_google_content_text(embed_url, session=sgy.s)
                     if entry["text"] is None and material_type == "page":
                         _log("    Export failed — clearing stale cache entry", sgy.verbose)
                         cache = _load_embed_cache()
@@ -1481,7 +1534,8 @@ def scrape_announcements(sgy: SchoologySession, child: Optional[dict], days: int
                 for ann in _parse_feed(usoup):
                     ann["course"] = ann.get("course") or course["name"]
                     announcements.append(ann)
-            except Exception:
+            except Exception as exc:
+                _log(f"  [warn] course announcements({course['name']}) failed: {exc}", sgy.verbose)
                 continue
 
     # Filter by recency
@@ -1658,6 +1712,7 @@ def output_summary(
     announcements: list,
     as_json: bool,
     homework_pages: Optional[list] = None,
+    warnings: Optional[list] = None,
 ):
     if as_json:
         data = {
@@ -1670,6 +1725,8 @@ def output_summary(
         }
         if homework_pages:
             data["homework_pages"] = homework_pages
+        if warnings:
+            data["warnings"] = warnings
         print(json.dumps(data, indent=2))
         return
 
@@ -1785,7 +1842,7 @@ def cmd_init(args):
     base_url = input(f"Base URL [{DEFAULT_BASE_URL}]: ").strip() or DEFAULT_BASE_URL
     school_nid = input("School NID (optional, press Enter to skip): ").strip()
     email = input("Email: ").strip()
-    password = input("Password: ").strip()
+    password = getpass.getpass("Password: ").strip()
 
     if not email or not password:
         print("Email and password are required.", file=sys.stderr)
@@ -1804,7 +1861,15 @@ def cmd_init(args):
         CONFIG_PATH.unlink()
 
     print(f"\nCredentials saved to {ENV_PATH}")
-    print("Run `sgy children` to verify login works.")
+    print("Testing login...")
+    try:
+        test_sgy = SchoologySession(verbose=True)
+        test_sgy.ensure_logged_in()
+        children = test_sgy.get_children()
+        print(f"Login successful! Found {len(children)} child(ren).")
+    except Exception as exc:
+        print(f"Warning: Login test failed: {exc}", file=sys.stderr)
+        print("Credentials saved but may be incorrect. Run `sgy children` to retry.", file=sys.stderr)
 
 
 def cmd_children(args):
@@ -1899,7 +1964,7 @@ def cmd_summary(args):
         pages = scrape_pages(sgy, child, fetch_google_docs=True)
         homework_pages = _filter_homework_pages(pages)
         output_summary(child, children, assignments, grades, announcements, args.json,
-                        homework_pages=homework_pages)
+                        homework_pages=homework_pages, warnings=sgy.warnings)
     else:
         if args.json:
             all_data = {
@@ -1917,6 +1982,8 @@ def cmd_summary(args):
                     "announcements": scrape_announcements(sgy, child, days=7),
                     "homework_pages": _filter_homework_pages(pages),
                 })
+            if sgy.warnings:
+                all_data["warnings"] = sgy.warnings
             print(json.dumps(all_data, indent=2))
         else:
             for child in children:
