@@ -277,6 +277,9 @@ class SchoologySession:
         self._parent_home_soup: Optional[BeautifulSoup] = None
         self._last_request_time = 0.0
         self._folder_cache: dict = {}
+        # Separate session for Google fetches (no Schoology auth cookies)
+        self._google_session = requests.Session()
+        self._google_session.headers.update({"User-Agent": DEFAULT_UA})
 
         # Derive URLs from config
         self.base_url = self.cfg["base_url"].rstrip("/")
@@ -340,7 +343,7 @@ class SchoologySession:
 
         try:
             self._do_login()
-        except RuntimeError:
+        except (RuntimeError, requests.RequestException):
             _log("Login failed, retrying in 3s...", self.verbose)
             time.sleep(3)
             self._do_login()
@@ -521,7 +524,8 @@ class SchoologySession:
         if sid in self._folder_cache:
             return self._folder_cache[sid]
         data = self.fetch_json(f"/v1/courses/{sid}/folder/0")
-        self._folder_cache[sid] = data
+        if data is not None:
+            self._folder_cache[sid] = data
         return data
 
 
@@ -715,6 +719,7 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
             folder_count += len(found)
         except Exception as exc:
             _log(f"  [warn] folder_api({cname}) failed: {exc}", sgy.verbose)
+            sgy.warnings.append(f"folder_api({cname}): {exc}")
 
         # Source 5: Materials HTML scrape (catches UI-rendered items)
         try:
@@ -727,6 +732,7 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
                     materials_count += 1
         except Exception as exc:
             _log(f"  [warn] materials_html({cname}) failed: {exc}", sgy.verbose)
+            sgy.warnings.append(f"materials_html({cname}): {exc}")
             continue
 
     source_counts["folder_api"] = folder_count
@@ -747,6 +753,7 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
             grades_count += len(found)
         except Exception as exc:
             _log(f"  [warn] grades_xref({cname}) failed: {exc}", sgy.verbose)
+            sgy.warnings.append(f"grades_xref({cname}): {exc}")
             continue
     source_counts["grades_xref"] = grades_count
 
@@ -815,6 +822,7 @@ def _scrape_calendar_assignments(sgy: SchoologySession) -> list:
                 })
     except Exception as exc:
         _log(f"  [warn] calendar_upcoming failed: {exc}", sgy.verbose)
+        sgy.warnings.append(f"calendar_upcoming: {exc}")
 
     # Strategy B: Calendar feed AJAX (full events range)
     if not results:
@@ -847,6 +855,7 @@ def _scrape_calendar_assignments(sgy: SchoologySession) -> list:
                     })
         except Exception as exc:
             _log(f"  [warn] calendar_feed failed: {exc}", sgy.verbose)
+            sgy.warnings.append(f"calendar_feed: {exc}")
 
     return results
 
@@ -903,6 +912,7 @@ def _get_assignments_from_grades(sgy: SchoologySession, sid: str) -> list:
         soup = sgy.fetch_page(f"/course/{sid}/student_grades")
     except Exception as exc:
         _log(f"  [warn] grades page for section {sid} failed: {exc}", sgy.verbose)
+        sgy.warnings.append(f"grades_page({sid}): {exc}")
         return []
 
     grade_table = soup.find("table", {"role": "presentation"})
@@ -1082,6 +1092,7 @@ def scrape_grades(sgy: SchoologySession, child: Optional[dict], detail: bool = T
                     grade_entry["items"] = detail_items
                 except Exception as exc:
                     _log(f"  [warn] grade detail for {course['name']} failed: {exc}", sgy.verbose)
+                    sgy.warnings.append(f"grade_detail({course['name']}): {exc}")
 
         grades.append(grade_entry)
 
@@ -1467,7 +1478,7 @@ def scrape_pages(
                 }
                 if fetch_google_docs and doc_id:
                     _log(f"    Fetching {kind}: {doc_id[:25]}...", sgy.verbose)
-                    entry["text"] = _fetch_google_content_text(embed_url, session=sgy.s)
+                    entry["text"] = _fetch_google_content_text(embed_url, session=sgy._google_session)
                     if entry["text"] is None and material_type == "page":
                         _log("    Export failed — clearing stale cache entry", sgy.verbose)
                         cache = _load_embed_cache()
@@ -1536,6 +1547,7 @@ def scrape_announcements(sgy: SchoologySession, child: Optional[dict], days: int
                     announcements.append(ann)
             except Exception as exc:
                 _log(f"  [warn] course announcements({course['name']}) failed: {exc}", sgy.verbose)
+                sgy.warnings.append(f"announcements({course['name']}): {exc}")
                 continue
 
     # Filter by recency
