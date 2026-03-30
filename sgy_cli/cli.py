@@ -79,9 +79,10 @@ def _load_env_file(path: Path) -> dict:
             key, _, val = line.partition("=")
             key = key.strip()
             val = val.strip()
-            # Strip surrounding quotes
+            # Strip surrounding quotes and unescape
             if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
                 val = val[1:-1]
+                val = val.replace('\\"', '"').replace("\\\\", "\\")
             env[key] = val
     return env
 
@@ -209,8 +210,7 @@ def _parse_date(date_str: str) -> Optional[datetime]:
         target = day_names[m_day.group(1)[:3]]
         current = now.weekday()
         delta = (target - current) % 7
-        if delta == 0:
-            delta = 7  # next week if same day
+        # delta == 0 means today (same weekday) — don't push to next week
         return (now + timedelta(days=delta)).replace(hour=23, minute=59, second=0, microsecond=0)
 
     # --- Absolute date formats ---
@@ -232,6 +232,9 @@ def _parse_date(date_str: str) -> Optional[datetime]:
     ):
         try:
             dt = datetime.strptime(date_str, fmt)
+            # Strip timezone info to keep all datetimes naive (compared with datetime.now())
+            if dt.tzinfo is not None:
+                dt = dt.replace(tzinfo=None)
             # If format had no year, fill in current year
             if fmt in ("%b %d", "%B %d"):
                 dt = dt.replace(year=now.year)
@@ -315,6 +318,12 @@ class SchoologySession:
             
         if r is None:
             raise RuntimeError("Request failed completely")
+        # All retries exhausted on 429 — raise instead of returning error response
+        if r.status_code == 429:
+            raise requests.exceptions.HTTPError(
+                f"Rate limited (429) after {max_retries} retries: {r.url}",
+                response=r,
+            )
         return r
 
     # -- login / session cache --
@@ -698,6 +707,7 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
 
     # --- Sources 4 & 5: Per-course folder API + materials HTML ---
     courses = get_courses_and_grades(sgy, child)
+    child_uid = child.get("uid", "") if child else ""
     max_courses = 15
     if len(courses) > max_courses:
         _log(f"  [warn] {len(courses)} courses found, limiting to {max_courses}", sgy.verbose)
@@ -709,6 +719,13 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
         if not sid:
             continue
         cname = course.get("name", "")
+
+        # Preview warmup — needed for parent accounts to access course-level URLs
+        if child_uid:
+            try:
+                sgy._request("GET", f"{sgy.base_url}/course/{sid}/preview/{child_uid}/parent", timeout=15)
+            except Exception as exc:
+                _log(f"  [warn] preview warmup({cname}) failed: {exc}", sgy.verbose)
 
         # Source 4: Folder API — structured list of ALL material types
         try:
@@ -739,12 +756,22 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
     source_counts["materials_html"] = materials_count
 
     # --- Source 6: Grades page cross-reference ---
+    # Note: preview warmup was already done in the sources 4&5 loop above,
+    # and the server-side auth context persists per-course, so we don't need
+    # to repeat warmup here if courses are the same. But if the loop above
+    # was truncated or skipped a course, we warm up again to be safe.
     grades_count = 0
     for course in courses[:max_courses]:
         sid = course.get("section_id", "")
         if not sid:
             continue
         cname = course.get("name", "")
+        # Preview warmup for parent accounts
+        if child_uid:
+            try:
+                sgy._request("GET", f"{sgy.base_url}/course/{sid}/preview/{child_uid}/parent", timeout=15)
+            except Exception:
+                pass  # warmup failure is non-fatal; _get_assignments_from_grades handles 403
         try:
             found = _get_assignments_from_grades(sgy, sid)
             for a in found:
@@ -1073,6 +1100,7 @@ def scrape_grades(sgy: SchoologySession, child: Optional[dict], detail: bool = T
 
     # Get overview from parent home (always available, single request)
     courses = get_courses_and_grades(sgy, child)
+    child_uid = child.get("uid", "") if child else ""
 
     grades = []
     for course in courses:
@@ -1087,6 +1115,12 @@ def scrape_grades(sgy: SchoologySession, child: Optional[dict], detail: bool = T
         if detail:
             sid = course.get("section_id", "")
             if sid:
+                # Preview warmup — needed for parent accounts to access student_grades
+                if child_uid:
+                    try:
+                        sgy._request("GET", f"{sgy.base_url}/course/{sid}/preview/{child_uid}/parent", timeout=15)
+                    except Exception as exc:
+                        _log(f"  [warn] preview warmup({course['name']}) failed: {exc}", sgy.verbose)
                 try:
                     detail_items = _scrape_course_grade_detail(sgy, sid)
                     grade_entry["items"] = detail_items
@@ -1865,7 +1899,8 @@ def cmd_init(args):
         if school_nid:
             f.write(f'SGY_SCHOOL_NID="{school_nid}"\n')
         f.write(f'SGY_EMAIL="{email}"\n')
-        f.write(f'SGY_PASSWORD="{password}"\n')
+        escaped_password = password.replace("\\", "\\\\").replace('"', '\\"')
+        f.write(f'SGY_PASSWORD="{escaped_password}"\n')
     os.chmod(ENV_PATH, 0o600)
 
     # Remove legacy config.json if it exists
