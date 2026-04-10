@@ -48,14 +48,22 @@ Config priority: env vars > `~/.sgy/.env` > `~/.sgy/config.json`
 ## Usage
 
 ```
-sgy children                             # list all children
-sgy assignments [--child NAME] [--days N]  # upcoming/overdue work
-sgy grades      [--child NAME]           # grades per course
-sgy announcements [--child NAME]         # recent feed updates
-sgy summary     [--child NAME]           # everything in one shot
+sgy children                                      # list all children
+sgy assignments [--child NAME] [--days N]         # upcoming/overdue work
+sgy grades      [--child NAME] [--detail]         # grades per course
+sgy announcements [--child NAME]                  # recent feed updates
+sgy summary     [--child NAME]                    # everything in one shot
+sgy pages       [--child NAME] [--course ID|NAME] [--no-docs]  # course pages + embedded Google Docs
 ```
 
 All commands accept `--json` for machine-readable output. `--child` takes a first-name substring match (e.g. `--child Alex`).
+
+| Flag | Command | Description |
+|---|---|---|
+| `--days N` | `assignments` | Look-ahead window in days (default: 14) |
+| `--detail` | `grades` | Fetch per-assignment grades (slow, ~3–5s per course) |
+| `--course` | `pages` | Filter by course/section ID or name substring |
+| `--no-docs` | `pages` | Skip fetching embedded Google Doc/Slides content |
 
 ## Examples
 
@@ -68,6 +76,15 @@ sgy summary --json
 
 # Just assignments for the next 7 days
 sgy assignments --child Taylor --days 7 --json
+
+# Per-assignment grade detail for one kid (slower)
+sgy grades --child Alex --detail --json
+
+# Course pages with embedded Google Slides content (e.g. homework slides)
+sgy pages --child Alex --json
+
+# Pages for a specific course only, skipping Google Docs fetch
+sgy pages --child Alex --course "Math" --no-docs --json
 ```
 
 ## AI Agent Integration (OpenClaw / ChatGPT / etc)
@@ -105,13 +122,20 @@ You have access to the `sgy` command-line tool to fetch the user's children's sc
 - `children`: Array of [{name, uid, building}]
 - `per_child`: Array containing the actual data per student
   - `child`: {name, uid, building}
+  - `scrape_confidence`: `"high"` | `"partial"` | `"failed"` — data reliability indicator
+  - `scrape_stages`: checkpoint results for auth, child_switch, courses, assignments, slides
+  - `scrape_errors`: list of error strings (e.g. `"slides: homeroom_not_found"`)
   - `assignments`: [{title, course, due_date, status, link}]
+  - `homework_slides`: [{course, title, content, fetched, error}] — Google Slides homework text
   - `grades`: [{course, grade, letter, items: []}]
   - `announcements`: [{title, body, author, date, course}]
+  - `warnings`: per-child non-fatal warnings from scraping
 
 When summarizing for the user:
 - Ignore courses where the `grade` is empty (`""` or `"—"`).
 - Highlight assignments due within the next 48 hours.
+- Check `scrape_confidence` first: if `"failed"`, alert the user that data may be missing.
+- Use `homework_slides[].content` for the actual text of what homework to do.
 - Do not output raw JSON to the user; format it into a friendly, readable daily briefing.
 ```
 
