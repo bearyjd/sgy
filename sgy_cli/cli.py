@@ -2075,6 +2075,28 @@ def _filter_homework_pages(pages: list) -> list:
     return results
 
 
+def _pages_to_homework_slides(pages: list) -> list:
+    """Convert _filter_homework_pages output to the homework_slides JSON format.
+
+    Each item in the output has: course, title, content (str|None), fetched (bool), error (str|None).
+    Content is the first non-empty Google embed text, falling back to body_text.
+    """
+    slides = []
+    for p in pages:
+        embed_texts = [e["text"] for e in p.get("google_embeds", []) if e.get("text")]
+        body = p.get("body_text", "")
+        content = embed_texts[0] if embed_texts else (body if body else None)
+        fetched = content is not None
+        slides.append({
+            "course": p.get("course", ""),
+            "title": p.get("title", ""),
+            "content": content,
+            "fetched": fetched,
+            "error": None if fetched else "no_content_found",
+        })
+    return slides
+
+
 def cmd_summary(args):
     sgy = SchoologySession(verbose=not args.json)
     children = sgy.get_children()

@@ -167,3 +167,70 @@ def test_scrape_pages_accepts_course_filter_param():
     sig = inspect.signature(scrape_pages)
     assert "course_filter" in sig.parameters
     assert sig.parameters["course_filter"].default == "all"
+
+
+# ---------------------------------------------------------------------------
+# _pages_to_homework_slides
+# ---------------------------------------------------------------------------
+
+def test_pages_to_homework_slides_with_embed_text():
+    from sgy_cli.cli import _pages_to_homework_slides
+    pages = [
+        {
+            "course": "Homeroom",
+            "title": "Weekly Homework Slide",
+            "body_text": "",
+            "google_embeds": [{"url": "https://slides.google.com/...", "type": "slides", "text": "Read pages 1-10"}],
+        }
+    ]
+    result = _pages_to_homework_slides(pages)
+    assert len(result) == 1
+    assert result[0]["course"] == "Homeroom"
+    assert result[0]["content"] == "Read pages 1-10"
+    assert result[0]["fetched"] is True
+    assert result[0]["error"] is None
+
+
+def test_pages_to_homework_slides_body_text_fallback():
+    from sgy_cli.cli import _pages_to_homework_slides
+    pages = [
+        {
+            "course": "Math",
+            "title": "Homework",
+            "body_text": "Complete worksheet 4B",
+            "google_embeds": [],
+        }
+    ]
+    result = _pages_to_homework_slides(pages)
+    assert result[0]["content"] == "Complete worksheet 4B"
+    assert result[0]["fetched"] is True
+
+
+def test_pages_to_homework_slides_no_content():
+    from sgy_cli.cli import _pages_to_homework_slides
+    pages = [
+        {
+            "course": "Science",
+            "title": "Homework",
+            "body_text": "",
+            "google_embeds": [{"url": "...", "type": "slides", "text": ""}],
+        }
+    ]
+    result = _pages_to_homework_slides(pages)
+    assert result[0]["content"] is None
+    assert result[0]["fetched"] is False
+    assert result[0]["error"] == "no_content_found"
+
+
+def test_pages_to_homework_slides_multiple_courses():
+    from sgy_cli.cli import _pages_to_homework_slides
+    pages = [
+        {"course": "Math", "title": "HW", "body_text": "p.23 #1-10", "google_embeds": []},
+        {"course": "ELA", "title": "HW", "body_text": "", "google_embeds": [{"url": "", "type": "slides", "text": "Read ch 5"}]},
+    ]
+    result = _pages_to_homework_slides(pages)
+    assert len(result) == 2
+    assert result[0]["course"] == "Math"
+    assert result[0]["content"] == "p.23 #1-10"
+    assert result[1]["course"] == "ELA"
+    assert result[1]["content"] == "Read ch 5"
