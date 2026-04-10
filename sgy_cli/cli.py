@@ -855,6 +855,31 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
             continue
     source_counts["grades_xref"] = grades_count
 
+    # --- Enrich: fill missing due_dates from v1 events API ---
+    enrich_count = 0
+    for item in all_items:
+        if item.get("due_date"):
+            continue
+        link = item.get("link", "")
+        m = re.search(r"event/(\d+)", link)
+        if not m:
+            continue
+        event_id = m.group(1)
+        try:
+            r = sgy._request("GET", f"{sgy.base_url}/v1/events/{event_id}", timeout=10)
+            if r.ok:
+                data = r.json()
+                start_ts = data.get("start")
+                if start_ts:
+                    item["due_date"] = datetime.fromtimestamp(int(start_ts)).strftime("%Y-%m-%d")
+                    enrich_count += 1
+                if not item.get("course"):
+                    item["course"] = data.get("realm_title", "") or data.get("section_title", "")
+        except Exception as exc:
+            _log(f"  [warn] enrich_event({event_id}) failed: {exc}", sgy.verbose)
+    if enrich_count:
+        source_counts["event_enrich"] = enrich_count
+
     # --- Deduplicate ---
     before_dedup = len(all_items)
     assignments = _dedup_assignments(all_items)
