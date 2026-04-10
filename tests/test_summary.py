@@ -154,3 +154,16 @@ def test_build_failed_child_all_empty_data():
     assert result["scrape_confidence"] == "failed"
     assert result["assignments"] == []
     assert result["homework_slides"] == []
+
+
+# ---------------------------------------------------------------------------
+# scrape_pages course_filter
+# ---------------------------------------------------------------------------
+
+def test_scrape_pages_accepts_course_filter_param():
+    """Verify scrape_pages signature accepts course_filter without TypeError."""
+    import inspect
+    from sgy_cli.cli import scrape_pages
+    sig = inspect.signature(scrape_pages)
+    assert "course_filter" in sig.parameters
+    assert sig.parameters["course_filter"].default == "all"

@@ -1517,6 +1517,7 @@ def scrape_pages(
     sgy: SchoologySession,
     child: Optional[dict],
     course_id: Optional[str] = None,
+    course_filter: str = "all",
     fetch_google_docs: bool = True,
 ) -> list:
     sgy.ensure_logged_in()
@@ -1528,7 +1529,14 @@ def scrape_pages(
         _log("No courses found.", sgy.verbose)
         return []
 
-    if course_id:
+    # course_filter: name substring match (used by cmd_summary for per-child targeting)
+    if course_filter != "all":
+        courses = [c for c in courses if course_filter.lower() in c.get("name", "").lower()]
+        if not courses:
+            _log(f"No courses matching '{course_filter}' found.", sgy.verbose)
+            return []
+    # course_id: ID/href/name match (used by cmd_pages --course flag)
+    elif course_id:
         filtered = [
             c for c in courses
             if c.get("section_id") == course_id
