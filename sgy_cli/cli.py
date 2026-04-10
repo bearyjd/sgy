@@ -2146,17 +2146,77 @@ def cmd_summary(args):
                 "per_child": [],
             }
             for child in children:
-                sgy.switch_to_child(child)
-                pages = scrape_pages(sgy, child, fetch_google_docs=True)
+                tracker = StageTracker()
+
+                # Stage: auth
+                try:
+                    sgy.ensure_logged_in()
+                    tracker.ok("auth")
+                except Exception as e:
+                    tracker.fail("auth", str(e))
+                    all_data["per_child"].append(build_failed_child(child, tracker))
+                    continue
+
+                # Stage: child_switch
+                try:
+                    sgy.switch_to_child(child)
+                    tracker.ok("child_switch")
+                except Exception as e:
+                    tracker.fail("child_switch", str(e))
+                    all_data["per_child"].append(build_failed_child(child, tracker))
+                    continue
+
+                # Stage: courses
+                courses = get_courses_and_grades(sgy, child)
+                if courses:
+                    tracker.ok("courses")
+                else:
+                    tracker.fail("courses", "no courses found")
+                    all_data["per_child"].append(build_failed_child(child, tracker))
+                    continue
+
+                # Stage: assignments
+                warn_before = len(sgy.warnings)
+                assignments = scrape_assignments(sgy, child, days=14)
+                new_warnings = len(sgy.warnings) - warn_before
+                if new_warnings:
+                    tracker.partial("assignments", f"{new_warnings} source error(s)")
+                else:
+                    tracker.ok("assignments")
+
+                # Stage: slides (per-child course targeting via SGY_HOMEWORK_COURSES)
+                course_filter = get_homework_target(child["name"])
+                raw_pages = scrape_pages(
+                    sgy, child,
+                    course_filter=course_filter,
+                    fetch_google_docs=True,
+                )
+                filtered_pages = _filter_homework_pages(raw_pages)
+                homework_slides = _pages_to_homework_slides(filtered_pages)
+                if not raw_pages and course_filter != "all":
+                    tracker.partial("slides", "homeroom_not_found")
+                elif any(not s["fetched"] for s in homework_slides):
+                    unfetched = sum(1 for s in homework_slides if not s["fetched"])
+                    tracker.partial("slides", f"{unfetched} slide fetch error(s)")
+                else:
+                    tracker.ok("slides")
+
+                # Grades and announcements (non-staged — failures go into warnings)
+                grades = scrape_grades(sgy, child, detail=False)
+                announcements = scrape_announcements(sgy, child, days=7)
+
                 all_data["per_child"].append({
                     "child": child,
-                    "assignments": scrape_assignments(sgy, child, days=14),
-                    "grades": scrape_grades(sgy, child, detail=False),
-                    "announcements": scrape_announcements(sgy, child, days=7),
-                    "homework_pages": _filter_homework_pages(pages),
+                    "scrape_confidence": tracker.confidence,
+                    "scrape_stages": tracker.stages,
+                    "scrape_errors": tracker.errors,
+                    "assignments": assignments,
+                    "homework_slides": homework_slides,
+                    "grades": grades,
+                    "announcements": announcements,
+                    "warnings": sgy.warnings[warn_before:],
                 })
-            if sgy.warnings:
-                all_data["warnings"] = sgy.warnings
+
             print(json.dumps(all_data, indent=2))
         else:
             for child in children:
