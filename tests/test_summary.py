@@ -77,3 +77,80 @@ def test_stage_tracker_auth_fail_gives_failed():
     t.fail("auth", "Login failed")
     assert t.confidence == "failed"
     assert "auth: Login failed" in t.errors
+
+
+# ---------------------------------------------------------------------------
+# get_homework_target
+# ---------------------------------------------------------------------------
+
+def test_get_homework_target_known_children(monkeypatch):
+    monkeypatch.setenv("SGY_HOMEWORK_COURSES", "Penn:homeroom,Jack:all,Ford:homeroom")
+    monkeypatch.delenv("SGY_HOMEWORK_COURSE", raising=False)
+    from sgy_cli.cli import get_homework_target
+    assert get_homework_target("Penn") == "homeroom"
+    assert get_homework_target("Jack") == "all"
+    assert get_homework_target("Ford") == "homeroom"
+
+
+def test_get_homework_target_case_insensitive(monkeypatch):
+    monkeypatch.setenv("SGY_HOMEWORK_COURSES", "Penn:homeroom")
+    monkeypatch.delenv("SGY_HOMEWORK_COURSE", raising=False)
+    from sgy_cli.cli import get_homework_target
+    assert get_homework_target("penn") == "homeroom"
+    assert get_homework_target("PENN") == "homeroom"
+
+
+def test_get_homework_target_unknown_child_defaults_all(monkeypatch):
+    monkeypatch.setenv("SGY_HOMEWORK_COURSES", "Penn:homeroom")
+    monkeypatch.delenv("SGY_HOMEWORK_COURSE", raising=False)
+    from sgy_cli.cli import get_homework_target
+    assert get_homework_target("NewKid") == "all"
+
+
+def test_get_homework_target_legacy_fallback(monkeypatch):
+    monkeypatch.delenv("SGY_HOMEWORK_COURSES", raising=False)
+    monkeypatch.setenv("SGY_HOMEWORK_COURSE", "homeroom")
+    from sgy_cli.cli import get_homework_target
+    assert get_homework_target("Anyone") == "homeroom"
+
+
+def test_get_homework_target_no_env_defaults_all(monkeypatch):
+    monkeypatch.delenv("SGY_HOMEWORK_COURSES", raising=False)
+    monkeypatch.delenv("SGY_HOMEWORK_COURSE", raising=False)
+    from sgy_cli.cli import get_homework_target
+    assert get_homework_target("Anyone") == "all"
+
+
+# ---------------------------------------------------------------------------
+# build_failed_child
+# ---------------------------------------------------------------------------
+
+def test_build_failed_child_shape():
+    from sgy_cli.cli import StageTracker, build_failed_child
+    child = {"name": "Jack", "uid": "456"}
+    t = StageTracker()
+    t.ok("auth")
+    t.ok("child_switch")
+    t.fail("courses", "no courses found")
+    result = build_failed_child(child, t)
+    assert result["child"] == child
+    assert result["scrape_confidence"] == "failed"
+    assert result["scrape_stages"]["auth"] == "ok"
+    assert result["scrape_stages"]["courses"] == "failed"
+    assert "courses: no courses found" in result["scrape_errors"]
+    assert result["assignments"] == []
+    assert result["homework_slides"] == []
+    assert result["grades"] == []
+    assert result["announcements"] == []
+    assert result["warnings"] == []
+
+
+def test_build_failed_child_all_empty_data():
+    from sgy_cli.cli import StageTracker, build_failed_child
+    child = {"name": "Penn", "uid": "123"}
+    t = StageTracker()
+    t.fail("auth", "Login failed")
+    result = build_failed_child(child, t)
+    assert result["scrape_confidence"] == "failed"
+    assert result["assignments"] == []
+    assert result["homework_slides"] == []

@@ -300,6 +300,38 @@ class StageTracker:
         return "high"
 
 
+def get_homework_target(child_name: str) -> str:
+    """Return 'all' or a course name substring for slide targeting.
+
+    Reads SGY_HOMEWORK_COURSES="Penn:homeroom,Jack:all,Ford:homeroom".
+    Falls back to SGY_HOMEWORK_COURSE (legacy single-child), then "all".
+    """
+    raw = os.environ.get("SGY_HOMEWORK_COURSES", "")
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if ":" not in pair:
+            continue
+        name, _, target = pair.partition(":")
+        if name.strip().lower() == child_name.strip().lower():
+            return target.strip()
+    return os.environ.get("SGY_HOMEWORK_COURSE", "all")
+
+
+def build_failed_child(child: dict, tracker: "StageTracker") -> dict:
+    """Build a per_child entry for a child whose scrape failed a critical stage."""
+    return {
+        "child": child,
+        "scrape_confidence": tracker.confidence,
+        "scrape_stages": tracker.stages,
+        "scrape_errors": tracker.errors,
+        "assignments": [],
+        "homework_slides": [],
+        "grades": [],
+        "announcements": [],
+        "warnings": [],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Schoology session management
 # ---------------------------------------------------------------------------
