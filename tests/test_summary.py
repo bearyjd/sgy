@@ -62,3 +62,18 @@ def test_stage_tracker_errors_accumulate():
     assert len(t.errors) == 2
     assert "assignments: err1" in t.errors
     assert "slides: err2" in t.errors
+
+
+def test_stage_tracker_default_state():
+    from sgy_cli.cli import StageTracker
+    t = StageTracker()
+    assert all(v == "pending" for v in t.stages.values())
+    assert t.errors == []
+
+
+def test_stage_tracker_auth_fail_gives_failed():
+    from sgy_cli.cli import StageTracker
+    t = StageTracker()
+    t.fail("auth", "Login failed")
+    assert t.confidence == "failed"
+    assert "auth: Login failed" in t.errors
