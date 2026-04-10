@@ -5,12 +5,13 @@ Logs in via session cookies, caches sessions, and scrapes
 assignments, grades, and announcements for all children.
 
 Usage:
-    sgy init                          — set up credentials interactively
-    sgy children                      — list children with IDs
+    sgy init                                          — set up credentials interactively
+    sgy children                                      — list children with IDs
     sgy assignments [--child NAME] [--days N] [--json]
-    sgy grades      [--child NAME] [--json]
+    sgy grades      [--child NAME] [--detail] [--json]
     sgy announcements [--child NAME] [--json]
     sgy summary     [--child NAME] [--json]
+    sgy pages       [--child NAME] [--course ID|NAME] [--no-docs] [--json]
 """
 
 import argparse
@@ -21,6 +22,7 @@ import random
 import re
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Union
@@ -259,6 +261,43 @@ def _extract_letter(grade_text: str) -> str:
     """Extract letter grade from a grade string like '95% A' or 'A+'."""
     m = re.search(r"\b([A-F][+-]?)\b", grade_text)
     return m.group(1) if m else ""
+
+
+# ---------------------------------------------------------------------------
+# Stage tracking for per-child scrape confidence
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StageTracker:
+    """Tracks checkpoint success/failure for one child's scrape run."""
+
+    stages: dict = field(default_factory=lambda: {
+        "auth": "pending",
+        "child_switch": "pending",
+        "courses": "pending",
+        "assignments": "pending",
+        "slides": "pending",
+    })
+    errors: list = field(default_factory=list)
+
+    def ok(self, stage: str):
+        self.stages[stage] = "ok"
+
+    def fail(self, stage: str, reason: str):
+        self.stages[stage] = "failed"
+        self.errors.append(f"{stage}: {reason}")
+
+    def partial(self, stage: str, reason: str):
+        self.stages[stage] = "partial"
+        self.errors.append(f"{stage}: {reason}")
+
+    @property
+    def confidence(self) -> str:
+        if any(self.stages[s] == "failed" for s in ["auth", "child_switch", "courses"]):
+            return "failed"
+        if any(v in ("failed", "partial") for v in self.stages.values()):
+            return "partial"
+        return "high"
 
 
 # ---------------------------------------------------------------------------
