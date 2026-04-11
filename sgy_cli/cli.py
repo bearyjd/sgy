@@ -227,8 +227,11 @@ def _parse_date(date_str: str) -> Optional[datetime]:
         "%m/%d/%y",
         "%b %d, %Y",
         "%B %d, %Y",
+        "%A, %B %d, %Y",
+        "%a, %B %d, %Y",
         "%b %d, %Y at %I:%M %p",
         "%B %d, %Y at %I:%M %p",
+        "%A, %B %d, %Y at %I:%M %p",
         "%b %d",          # "Mar 21" — assume current year
         "%B %d",          # "March 21"
     ):
@@ -855,7 +858,7 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
             continue
     source_counts["grades_xref"] = grades_count
 
-    # --- Enrich: fill missing due_dates from v1 events API ---
+    # --- Enrich: fill missing due_dates from v1 events API or profile page ---
     enrich_count = 0
     for item in all_items:
         if item.get("due_date"):
@@ -865,6 +868,8 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
         if not m:
             continue
         event_id = m.group(1)
+        enriched = False
+        # Try v1 events API first (works for non-parent accounts)
         try:
             r = sgy._request("GET", f"{sgy.base_url}/v1/events/{event_id}", timeout=10)
             if r.ok:
@@ -872,11 +877,38 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
                 start_ts = data.get("start")
                 if start_ts:
                     item["due_date"] = datetime.fromtimestamp(int(start_ts)).strftime("%Y-%m-%d")
-                    enrich_count += 1
+                    enriched = True
                 if not item.get("course"):
                     item["course"] = data.get("realm_title", "") or data.get("section_title", "")
         except Exception as exc:
-            _log(f"  [warn] enrich_event({event_id}) failed: {exc}", sgy.verbose)
+            _log(f"  [warn] enrich_event_api({event_id}) failed: {exc}", sgy.verbose)
+        # Fallback: scrape event profile page (parent accounts get 500 from API)
+        if not enriched and link:
+            try:
+                profile_url = f"{sgy.base_url}{link}" if link.startswith("/") else link
+                pr = sgy._request("GET", profile_url, timeout=15)
+                if pr.ok:
+                    psoup = BeautifulSoup(pr.text, "html.parser")
+                    info_table = psoup.select_one("table.info-tab")
+                    if info_table:
+                        for tr in info_table.select("tr"):
+                            th = tr.select_one("th")
+                            td = tr.select_one("td")
+                            if th and td and th.get_text(strip=True).lower() == "time":
+                                raw_date = td.get_text(strip=True)
+                                parsed = _parse_date(raw_date)
+                                if parsed:
+                                    item["due_date"] = parsed.strftime("%Y-%m-%d")
+                                    enriched = True
+                                break
+                    if not item.get("course"):
+                        course_el = psoup.select_one(".course-title, .info-header h2")
+                        if course_el:
+                            item["course"] = course_el.get_text(strip=True)
+            except Exception as exc:
+                _log(f"  [warn] enrich_event_profile({event_id}) failed: {exc}", sgy.verbose)
+        if enriched:
+            enrich_count += 1
     if enrich_count:
         source_counts["event_enrich"] = enrich_count
 
