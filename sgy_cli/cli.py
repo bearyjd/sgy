@@ -42,6 +42,7 @@ EMBED_CACHE_PATH = SGY_DIR / "embed_cache.json"
 
 DEFAULT_BASE_URL = "https://app.schoology.com"
 DEFAULT_SCHOOL_NID = ""
+DEFAULT_MAX_COURSES = 25
 
 DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -844,11 +845,11 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
     courses = get_courses_and_grades(sgy, child)
     child_uid = child.get("uid", "") if child else ""
     try:
-        max_courses = int(os.environ.get("SGY_MAX_COURSES", "25"))
+        max_courses = int(os.environ.get("SGY_MAX_COURSES", str(DEFAULT_MAX_COURSES)))
         if max_courses < 1:
-            max_courses = 25
+            max_courses = DEFAULT_MAX_COURSES
     except ValueError:
-        max_courses = 25
+        max_courses = DEFAULT_MAX_COURSES
     if len(courses) > max_courses:
         _log(f"  [warn] {len(courses)} courses found, limiting to {max_courses}", sgy.verbose)
         sgy.warnings.append(f"courses_truncated: {len(courses)} courses, showing {max_courses}")
@@ -1400,7 +1401,7 @@ def _discover_page_embeds(sgy: SchoologySession, page_id: str, sid: str, child_u
     if not child_uid:
         return []
 
-    _log(f"    Discovering embeds via preview warmup...", sgy.verbose)
+    _log("    Discovering embeds via preview warmup...", sgy.verbose)
     sgy._request("GET", f"{sgy.base_url}/course/{sid}/preview/{child_uid}/parent", timeout=15)
 
     r = sgy._request("GET", f"{sgy.base_url}/page/{page_id}", timeout=15)
@@ -2162,27 +2163,34 @@ def _filter_homework_pages(pages: list) -> list:
     return results
 
 
-def _pages_to_homework_slides(pages: list) -> list:
+def _pages_to_homework_slides(pages: list, base_url: str = "") -> list:
     """Convert _filter_homework_pages output to the homework_slides JSON format.
 
-    Each item in the output has: course, title, content (str|None), fetched (bool), error (str|None).
+    Each item in the output has: course, title, content (str|None), fetched (bool), error (str|None),
+    page_url (absolute when base_url is set, path-only otherwise), embed_urls (list[str]).
     Content is the first non-empty Google embed text, falling back to body_text.
     """
     slides = []
     for p in pages:
-        embed_texts = [e["text"] for e in p.get("google_embeds", []) if e.get("text")]
-        embed_urls = [e["url"] for e in p.get("google_embeds", []) if e.get("url")]
+        embed_texts: list = []
+        embed_urls: list = []
+        for e in p.get("google_embeds", []):
+            if e.get("text"):
+                embed_texts.append(e["text"])
+            if e.get("url"):
+                embed_urls.append(e["url"])
         body = p.get("body_text", "")
         content = embed_texts[0] if embed_texts else (body if body else None)
         fetched = content is not None
         page_id = p.get("page_id", "")
+        page_url = f"{base_url}/page/{page_id}" if page_id else ""
         slides.append({
             "course": p.get("course", ""),
             "title": p.get("title", ""),
             "content": content,
             "fetched": fetched,
             "error": None if fetched else "no_content_found",
-            "page_url": f"/page/{page_id}" if page_id else "",
+            "page_url": page_url,
             "embed_urls": embed_urls,
         })
     return slides
@@ -2259,7 +2267,7 @@ def cmd_summary(args):
                         fetch_google_docs=True,
                     )
                     filtered_pages = _filter_homework_pages(raw_pages)
-                    homework_slides = _pages_to_homework_slides(filtered_pages)
+                    homework_slides = _pages_to_homework_slides(filtered_pages, base_url=sgy.base_url)
                     if not raw_pages and course_filter != "all":
                         tracker.partial("slides", "homeroom_not_found")
                     elif any(not s["fetched"] for s in homework_slides):

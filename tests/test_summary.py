@@ -1,6 +1,4 @@
 """Tests for StageTracker, get_homework_target, build_failed_child, _pages_to_homework_slides."""
-import os
-import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +498,17 @@ def test_pages_to_homework_slides_missing_page_id_safe():
     result = _pages_to_homework_slides(pages)
     assert result[0]["page_url"] == ""
     assert result[0]["embed_urls"] == []
+
+
+def test_pages_to_homework_slides_absolute_page_url_when_base_url():
+    """When base_url is passed, page_url is fully qualified."""
+    from sgy_cli.cli import _pages_to_homework_slides
+    pages = [{
+        "course": "X", "title": "Y", "page_id": "999",
+        "body_text": "z", "google_embeds": [],
+    }]
+    result = _pages_to_homework_slides(pages, base_url="https://arlingtondiocese.schoology.com")
+    assert result[0]["page_url"] == "https://arlingtondiocese.schoology.com/page/999"
 
 
 # ---------------------------------------------------------------------------
