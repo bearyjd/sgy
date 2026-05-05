@@ -234,3 +234,212 @@ def test_pages_to_homework_slides_multiple_courses():
     assert result[0]["content"] == "p.23 #1-10"
     assert result[1]["course"] == "ELA"
     assert result[1]["content"] == "Read ch 5"
+
+
+# ---------------------------------------------------------------------------
+# _parse_date weekday formats
+# ---------------------------------------------------------------------------
+
+def test_parse_date_full_weekday():
+    from sgy_cli.cli import _parse_date
+    dt = _parse_date("Friday, May 8, 2026")
+    assert dt is not None
+    assert (dt.year, dt.month, dt.day) == (2026, 5, 8)
+
+
+def test_parse_date_abbreviated_weekday():
+    from sgy_cli.cli import _parse_date
+    dt = _parse_date("Mon, May 11, 2026")
+    assert dt is not None
+    assert (dt.year, dt.month, dt.day) == (2026, 5, 11)
+
+
+def test_parse_date_full_weekday_with_time():
+    from sgy_cli.cli import _parse_date
+    dt = _parse_date("Friday, May 8, 2026 at 11:59 PM")
+    assert dt is not None
+    assert (dt.year, dt.month, dt.day, dt.hour, dt.minute) == (2026, 5, 8, 23, 59)
+
+
+def test_parse_date_returns_none_on_garbage():
+    from sgy_cli.cli import _parse_date
+    assert _parse_date("not a date") is None
+
+
+# ---------------------------------------------------------------------------
+# _enrich_event_dates
+# ---------------------------------------------------------------------------
+
+def _make_response(ok, text="", json_data=None, status_code=200):
+    from unittest.mock import MagicMock
+    r = MagicMock()
+    r.ok = ok
+    r.status_code = status_code
+    r.text = text
+    r.json = MagicMock(return_value=json_data or {})
+    return r
+
+
+def test_enrich_event_dates_uses_api_when_ok():
+    from unittest.mock import MagicMock
+    from sgy_cli.cli import _enrich_event_dates
+
+    sgy = MagicMock()
+    sgy.base_url = "https://test.schoology.com"
+    sgy.verbose = False
+
+    # 2026-05-08 11:59:00 UTC = 1746748740
+    sgy._request = MagicMock(return_value=_make_response(
+        ok=True, json_data={"start": 1746748740, "realm_title": "Reading 5Gold"}
+    ))
+
+    items = [{"title": "X", "link": "/event/123", "due_date": "", "course": ""}]
+    n = _enrich_event_dates(sgy, items)
+
+    assert n == 1
+    assert items[0]["due_date"]  # set; exact value timezone-dependent so don't pin
+    assert items[0]["course"] == "Reading 5Gold"
+    assert sgy._request.call_count == 1
+
+
+def test_enrich_event_dates_falls_back_to_profile_on_api_500():
+    from unittest.mock import MagicMock
+    from sgy_cli.cli import _enrich_event_dates
+
+    sgy = MagicMock()
+    sgy.base_url = "https://test.schoology.com"
+    sgy.verbose = False
+
+    profile_html = """
+    <html><body>
+      <table class="info-tab">
+        <tr><th>Type</th><td>Assignment</td></tr>
+        <tr><th>Time</th><td>Friday, May 8, 2026 at 11:59 PM</td></tr>
+        <tr><th>Where</th><td>Schoology</td></tr>
+      </table>
+      <h2 class="course-title">Reading: Section 5Gold</h2>
+    </body></html>
+    """
+
+    def router(method, url, **kwargs):
+        if "/v1/events/" in url:
+            return _make_response(ok=False, status_code=500)
+        if url.endswith("/event/123"):
+            return _make_response(ok=True, text=profile_html)
+        return _make_response(ok=False, status_code=404)
+    sgy._request = MagicMock(side_effect=router)
+
+    items = [{"title": "Reading Project", "link": "/event/123", "due_date": "", "course": ""}]
+    n = _enrich_event_dates(sgy, items)
+
+    assert n == 1
+    assert items[0]["due_date"] == "2026-05-08"
+    assert items[0]["course"] == "Reading: Section 5Gold"
+    # Once for API, once for profile
+    assert sgy._request.call_count == 2
+
+
+def test_enrich_event_dates_skips_when_no_event_id():
+    from unittest.mock import MagicMock
+    from sgy_cli.cli import _enrich_event_dates
+
+    sgy = MagicMock()
+    sgy.base_url = "https://test.schoology.com"
+    sgy.verbose = False
+    sgy._request = MagicMock()
+
+    items = [{"title": "X", "link": "/assignment/999", "due_date": "", "course": "Math"}]
+    n = _enrich_event_dates(sgy, items)
+
+    assert n == 0
+    assert items[0]["due_date"] == ""
+    sgy._request.assert_not_called()
+
+
+def test_enrich_event_dates_skips_when_already_has_date():
+    from unittest.mock import MagicMock
+    from sgy_cli.cli import _enrich_event_dates
+
+    sgy = MagicMock()
+    sgy.base_url = "https://test.schoology.com"
+    sgy.verbose = False
+    sgy._request = MagicMock()
+
+    items = [{"title": "X", "link": "/event/123", "due_date": "2026-05-01", "course": ""}]
+    n = _enrich_event_dates(sgy, items)
+
+    assert n == 0
+    sgy._request.assert_not_called()
+
+
+def test_enrich_event_dates_handles_profile_without_time_row():
+    from unittest.mock import MagicMock
+    from sgy_cli.cli import _enrich_event_dates
+
+    sgy = MagicMock()
+    sgy.base_url = "https://test.schoology.com"
+    sgy.verbose = False
+
+    profile_html = """
+    <html><body>
+      <table class="info-tab">
+        <tr><th>Type</th><td>Assignment</td></tr>
+        <tr><th>Where</th><td>Schoology</td></tr>
+      </table>
+    </body></html>
+    """
+
+    def router(method, url, **kwargs):
+        if "/v1/events/" in url:
+            return _make_response(ok=False, status_code=500)
+        return _make_response(ok=True, text=profile_html)
+    sgy._request = MagicMock(side_effect=router)
+
+    items = [{"title": "X", "link": "/event/123", "due_date": "", "course": ""}]
+    n = _enrich_event_dates(sgy, items)
+
+    assert n == 0
+    assert items[0]["due_date"] == ""
+
+
+def test_enrich_event_dates_continues_after_exception():
+    """One item raising must not stop enrichment of subsequent items."""
+    from unittest.mock import MagicMock
+    from sgy_cli.cli import _enrich_event_dates
+
+    sgy = MagicMock()
+    sgy.base_url = "https://test.schoology.com"
+    sgy.verbose = False
+
+    profile_html = """
+    <table class="info-tab">
+      <tr><th>Time</th><td>Mon, May 11, 2026</td></tr>
+    </table>
+    """
+
+    call_count = {"n": 0}
+
+    def router(method, url, **kwargs):
+        call_count["n"] += 1
+        # First item's API call raises
+        if call_count["n"] == 1:
+            raise RuntimeError("boom")
+        # First item's profile call also raises
+        if call_count["n"] == 2:
+            raise RuntimeError("boom2")
+        # Second item's API returns 500
+        if "/v1/events/" in url:
+            return _make_response(ok=False, status_code=500)
+        # Second item's profile succeeds
+        return _make_response(ok=True, text=profile_html)
+    sgy._request = MagicMock(side_effect=router)
+
+    items = [
+        {"title": "First", "link": "/event/100", "due_date": "", "course": ""},
+        {"title": "Second", "link": "/event/200", "due_date": "", "course": ""},
+    ]
+    n = _enrich_event_dates(sgy, items)
+
+    assert n == 1
+    assert items[0]["due_date"] == ""        # first item unchanged
+    assert items[1]["due_date"] == "2026-05-11"  # second item enriched
