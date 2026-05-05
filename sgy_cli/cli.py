@@ -1167,6 +1167,15 @@ def _parse_upcoming_events(soup: BeautifulSoup) -> list:
         if time_el:
             due = time_el.get("datetime", "") or time_el.get_text(strip=True) or due
 
+        # Schoology renders due text as "Due Friday, May 8, 2026 at 11:59 PM" or
+        # similar. Strip the leading prefix and normalize to ISO when parseable
+        # so downstream consumers see a real date instead of human-readable text.
+        if due:
+            stripped = re.sub(r"^(Due|Closed)\s+", "", due, flags=re.IGNORECASE)
+            parsed = _parse_date(stripped)
+            if parsed:
+                due = parsed.strftime("%Y-%m-%d")
+
         status = "unknown"
         status_el = event.select_one('.submission-status, [class*="status"]')
         if status_el:

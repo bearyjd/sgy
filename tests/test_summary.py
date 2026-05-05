@@ -267,6 +267,46 @@ def test_parse_date_returns_none_on_garbage():
 
 
 # ---------------------------------------------------------------------------
+# _parse_upcoming_events normalizes "Due {weekday}, ..." to ISO
+# ---------------------------------------------------------------------------
+
+def test_upcoming_events_normalizes_due_prefix_to_iso():
+    """Home-widget items with 'Due Friday, May 8, 2026' must store '2026-05-08'."""
+    from bs4 import BeautifulSoup
+    from sgy_cli.cli import _parse_upcoming_events
+
+    html = """
+    <div class="upcoming-event">
+      <div class="event-title"><a href="/event/100">Reading Project</a></div>
+      <div class="readonly-title event-subtitle">Due Friday, May 8, 2026</div>
+      <div class="readonly-title event-subtitle">Reading</div>
+    </div>
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    items = _parse_upcoming_events(soup)
+    assert len(items) == 1
+    assert items[0]["due_date"] == "2026-05-08"
+    assert items[0]["course"] == "Reading"
+
+
+def test_upcoming_events_keeps_raw_text_when_unparseable():
+    """If the due text doesn't parse, leave it as-is (don't blank it)."""
+    from bs4 import BeautifulSoup
+    from sgy_cli.cli import _parse_upcoming_events
+
+    html = """
+    <div class="upcoming-event">
+      <div class="event-title"><a href="/event/200">X</a></div>
+      <div class="readonly-title event-subtitle">Due whenever</div>
+      <div class="readonly-title event-subtitle">Math</div>
+    </div>
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    items = _parse_upcoming_events(soup)
+    assert items[0]["due_date"] == "Due whenever"
+
+
+# ---------------------------------------------------------------------------
 # _enrich_event_dates
 # ---------------------------------------------------------------------------
 
