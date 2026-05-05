@@ -843,7 +843,12 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
     # --- Sources 4 & 5: Per-course folder API + materials HTML ---
     courses = get_courses_and_grades(sgy, child)
     child_uid = child.get("uid", "") if child else ""
-    max_courses = 15
+    try:
+        max_courses = int(os.environ.get("SGY_MAX_COURSES", "25"))
+        if max_courses < 1:
+            max_courses = 25
+    except ValueError:
+        max_courses = 25
     if len(courses) > max_courses:
         _log(f"  [warn] {len(courses)} courses found, limiting to {max_courses}", sgy.verbose)
         sgy.warnings.append(f"courses_truncated: {len(courses)} courses, showing {max_courses}")
@@ -2084,10 +2089,14 @@ def cmd_children(args):
 
 def cmd_assignments(args):
     sgy = SchoologySession(verbose=not args.json)
-    child = sgy.resolve_child(args.child) if args.child else None
-    if args.child and not child:
-        print(f"Child '{args.child}' not found.", file=sys.stderr)
-        sys.exit(1)
+    if args.child:
+        child = sgy.resolve_child(args.child)
+        if not child:
+            print(f"Child '{args.child}' not found.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        children = sgy.get_children()
+        child = children[0] if children else None
     assignments = scrape_assignments(sgy, child, days=args.days)
     output_assignments(assignments, args.json)
 
@@ -2162,15 +2171,19 @@ def _pages_to_homework_slides(pages: list) -> list:
     slides = []
     for p in pages:
         embed_texts = [e["text"] for e in p.get("google_embeds", []) if e.get("text")]
+        embed_urls = [e["url"] for e in p.get("google_embeds", []) if e.get("url")]
         body = p.get("body_text", "")
         content = embed_texts[0] if embed_texts else (body if body else None)
         fetched = content is not None
+        page_id = p.get("page_id", "")
         slides.append({
             "course": p.get("course", ""),
             "title": p.get("title", ""),
             "content": content,
             "fetched": fetched,
             "error": None if fetched else "no_content_found",
+            "page_url": f"/page/{page_id}" if page_id else "",
+            "embed_urls": embed_urls,
         })
     return slides
 

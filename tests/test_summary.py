@@ -307,6 +307,202 @@ def test_upcoming_events_keeps_raw_text_when_unparseable():
 
 
 # ---------------------------------------------------------------------------
+# SGY_MAX_COURSES env override
+# ---------------------------------------------------------------------------
+
+def test_max_courses_env_override(monkeypatch):
+    """Setting SGY_MAX_COURSES changes the cap used by scrape_assignments."""
+    from unittest.mock import MagicMock, patch
+    from sgy_cli.cli import scrape_assignments
+
+    monkeypatch.setenv("SGY_MAX_COURSES", "3")
+    sgy = MagicMock()
+    sgy.base_url = "https://test.schoology.com"
+    sgy.verbose = False
+    sgy.warnings = []
+    sgy.ensure_logged_in = MagicMock()
+    sgy.switch_to_child = MagicMock()
+    sgy.fetch_json = MagicMock(return_value=None)
+    sgy.fetch_page = MagicMock(side_effect=Exception("skip"))
+    sgy._request = MagicMock(side_effect=Exception("skip"))
+
+    five_courses = [{"section_id": str(i), "name": f"C{i}"} for i in range(5)]
+    with patch("sgy_cli.cli.get_courses_and_grades", return_value=five_courses), \
+         patch("sgy_cli.cli._scrape_calendar_assignments", return_value=[]), \
+         patch("sgy_cli.cli._get_assignments_from_folder_api", return_value=[]), \
+         patch("sgy_cli.cli._get_assignments_from_grades", return_value=[]):
+        scrape_assignments(sgy, child={"uid": "1"}, days=14)
+
+    truncations = [w for w in sgy.warnings if "courses_truncated" in w]
+    assert truncations
+    assert "showing 3" in truncations[0]
+
+
+def test_max_courses_invalid_env_falls_back(monkeypatch):
+    """A non-integer SGY_MAX_COURSES must not crash; cap defaults to 25."""
+    from unittest.mock import MagicMock, patch
+    from sgy_cli.cli import scrape_assignments
+
+    monkeypatch.setenv("SGY_MAX_COURSES", "not-a-number")
+    sgy = MagicMock()
+    sgy.base_url = "https://test.schoology.com"
+    sgy.verbose = False
+    sgy.warnings = []
+    sgy.ensure_logged_in = MagicMock()
+    sgy.switch_to_child = MagicMock()
+    sgy.fetch_json = MagicMock(return_value=None)
+    sgy.fetch_page = MagicMock(side_effect=Exception("skip"))
+    sgy._request = MagicMock(side_effect=Exception("skip"))
+
+    # 30 courses → with cap=25 default, expect truncation showing 25
+    courses = [{"section_id": str(i), "name": f"C{i}"} for i in range(30)]
+    with patch("sgy_cli.cli.get_courses_and_grades", return_value=courses), \
+         patch("sgy_cli.cli._scrape_calendar_assignments", return_value=[]), \
+         patch("sgy_cli.cli._get_assignments_from_folder_api", return_value=[]), \
+         patch("sgy_cli.cli._get_assignments_from_grades", return_value=[]):
+        scrape_assignments(sgy, child={"uid": "1"}, days=14)
+
+    truncations = [w for w in sgy.warnings if "courses_truncated" in w]
+    assert truncations
+    assert "showing 25" in truncations[0]
+
+
+def test_max_courses_no_truncation_when_under_cap(monkeypatch):
+    """16 courses under default cap of 25: no truncation warning."""
+    from unittest.mock import MagicMock, patch
+    from sgy_cli.cli import scrape_assignments
+
+    monkeypatch.delenv("SGY_MAX_COURSES", raising=False)
+    sgy = MagicMock()
+    sgy.base_url = "https://test.schoology.com"
+    sgy.verbose = False
+    sgy.warnings = []
+    sgy.ensure_logged_in = MagicMock()
+    sgy.switch_to_child = MagicMock()
+    sgy.fetch_json = MagicMock(return_value=None)
+    sgy.fetch_page = MagicMock(side_effect=Exception("skip"))
+    sgy._request = MagicMock(side_effect=Exception("skip"))
+
+    courses = [{"section_id": str(i), "name": f"C{i}"} for i in range(16)]
+    with patch("sgy_cli.cli.get_courses_and_grades", return_value=courses), \
+         patch("sgy_cli.cli._scrape_calendar_assignments", return_value=[]), \
+         patch("sgy_cli.cli._get_assignments_from_folder_api", return_value=[]), \
+         patch("sgy_cli.cli._get_assignments_from_grades", return_value=[]):
+        scrape_assignments(sgy, child={"uid": "1"}, days=14)
+
+    assert not any("courses_truncated" in w for w in sgy.warnings)
+
+
+# ---------------------------------------------------------------------------
+# cmd_assignments default child
+# ---------------------------------------------------------------------------
+
+def test_cmd_assignments_defaults_to_first_child():
+    """Without --child, cmd_assignments must select children[0] for warmup."""
+    from unittest.mock import MagicMock, patch
+    from sgy_cli.cli import cmd_assignments
+
+    args = MagicMock()
+    args.child = None
+    args.days = 7
+    args.json = False
+
+    first_child = {"uid": "111", "name": "Ford"}
+    mock_session = MagicMock()
+    mock_session.get_children = MagicMock(return_value=[first_child, {"uid": "222", "name": "John"}])
+
+    with patch("sgy_cli.cli.SchoologySession", return_value=mock_session), \
+         patch("sgy_cli.cli.scrape_assignments", return_value=[]) as scrape, \
+         patch("sgy_cli.cli.output_assignments"):
+        cmd_assignments(args)
+
+    scrape.assert_called_once()
+    called_child = scrape.call_args.args[1]
+    assert called_child == first_child
+
+
+def test_cmd_assignments_with_explicit_child_uses_resolve():
+    """With --child, cmd_assignments must call resolve_child, not get_children."""
+    from unittest.mock import MagicMock, patch
+    from sgy_cli.cli import cmd_assignments
+
+    args = MagicMock()
+    args.child = "Ford"
+    args.days = 7
+    args.json = False
+
+    ford = {"uid": "111", "name": "Ford"}
+    mock_session = MagicMock()
+    mock_session.resolve_child = MagicMock(return_value=ford)
+    mock_session.get_children = MagicMock()  # should NOT be called
+
+    with patch("sgy_cli.cli.SchoologySession", return_value=mock_session), \
+         patch("sgy_cli.cli.scrape_assignments", return_value=[]) as scrape, \
+         patch("sgy_cli.cli.output_assignments"):
+        cmd_assignments(args)
+
+    mock_session.resolve_child.assert_called_once_with("Ford")
+    mock_session.get_children.assert_not_called()
+    scrape.assert_called_once()
+    assert scrape.call_args.args[1] == ford
+
+
+def test_cmd_assignments_no_children_passes_none():
+    """If get_children returns empty, child stays None and scrape proceeds."""
+    from unittest.mock import MagicMock, patch
+    from sgy_cli.cli import cmd_assignments
+
+    args = MagicMock()
+    args.child = None
+    args.days = 7
+    args.json = False
+
+    mock_session = MagicMock()
+    mock_session.get_children = MagicMock(return_value=[])
+
+    with patch("sgy_cli.cli.SchoologySession", return_value=mock_session), \
+         patch("sgy_cli.cli.scrape_assignments", return_value=[]) as scrape, \
+         patch("sgy_cli.cli.output_assignments"):
+        cmd_assignments(args)
+
+    assert scrape.call_args.args[1] is None
+
+
+# ---------------------------------------------------------------------------
+# _pages_to_homework_slides new fields
+# ---------------------------------------------------------------------------
+
+def test_pages_to_homework_slides_includes_page_url_and_embed_urls():
+    from sgy_cli.cli import _pages_to_homework_slides
+    pages = [{
+        "course": "Science: Section 5Gold",
+        "title": "Skeletal System Slides",
+        "page_id": "7891690888",
+        "body_text": "",
+        "google_embeds": [
+            {"url": "https://docs.google.com/presentation/d/abc/edit", "type": "slides", "text": ""},
+            {"url": "https://docs.google.com/presentation/d/def/edit", "type": "slides", "text": ""},
+        ],
+    }]
+    result = _pages_to_homework_slides(pages)
+    assert result[0]["page_url"] == "/page/7891690888"
+    assert result[0]["embed_urls"] == [
+        "https://docs.google.com/presentation/d/abc/edit",
+        "https://docs.google.com/presentation/d/def/edit",
+    ]
+    assert result[0]["fetched"] is False
+    assert result[0]["error"] == "no_content_found"
+
+
+def test_pages_to_homework_slides_missing_page_id_safe():
+    from sgy_cli.cli import _pages_to_homework_slides
+    pages = [{"course": "X", "title": "Y", "body_text": "z", "google_embeds": []}]
+    result = _pages_to_homework_slides(pages)
+    assert result[0]["page_url"] == ""
+    assert result[0]["embed_urls"] == []
+
+
+# ---------------------------------------------------------------------------
 # _enrich_event_dates
 # ---------------------------------------------------------------------------
 
