@@ -1,0 +1,36 @@
+<!--
+  Synthetic (fabricated) fixture — NOT captured from a real Schoology account.
+  Mimics the documented row shape for /course/{sid}/materials from NOTES.md
+  ("Materials Page is Fully SPA-Rendered" / server-rendered HTML fallback) and
+  the selectors scrape_assignments uses:
+    .type-assignment, .type-discussion, .type-assessment, .material-row
+  All names, ids, and dates below are fake placeholders.
+-->
+<html>
+<body>
+<div id="course-profile-materials">
+  <table>
+    <tr class="type-assignment">
+      <td class="title">
+        <a class="sExtlink-processed" href="/course/9999999999/assignment/1001">Fake Worksheet A</a>
+      </td>
+      <td><span class="due-date">2026-05-01</span></td>
+    </tr>
+    <tr class="type-discussion">
+      <td class="title">
+        <a href="/course/9999999999/discussion/1002">Fake Discussion B</a>
+      </td>
+      <td><time datetime="2026-05-03">May 3</time></td>
+    </tr>
+    <tr class="material-row">
+      <td class="title">
+        <a href="/course/9999999999/assessment/1003">Fake Quiz C</a>
+      </td>
+    </tr>
+    <tr class="type-folder">
+      <td class="title">Fake Subfolder (should be ignored — no matching class)</td>
+    </tr>
+  </table>
+</div>
+</body>
+</html>

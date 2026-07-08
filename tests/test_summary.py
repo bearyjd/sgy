@@ -688,3 +688,115 @@ def test_enrich_event_dates_continues_after_exception():
     assert n == 1
     assert items[0]["due_date"] == ""        # first item unchanged
     assert items[1]["due_date"] == "2026-05-11"  # second item enriched
+
+
+# ---------------------------------------------------------------------------
+# SchoologySession.warmup_course
+# ---------------------------------------------------------------------------
+
+def _make_real_sgy(monkeypatch):
+    """Build a real SchoologySession (not a mock) with _request stubbed out,
+    so warmup_course's own dedup logic (._warmed_courses) is exercised for real.
+    """
+    from unittest.mock import MagicMock
+    from sgy_cli.cli import SchoologySession
+    monkeypatch.setenv("SGY_EMAIL", "test@example.com")
+    monkeypatch.setenv("SGY_PASSWORD", "hunter2")
+    monkeypatch.setenv("SGY_BASE_URL", "https://test.schoology.com")
+    sgy = SchoologySession(verbose=False)
+    sgy._request = MagicMock(return_value=_make_response(ok=True))
+    return sgy
+
+
+def test_warmup_course_is_idempotent_per_session(monkeypatch):
+    sgy = _make_real_sgy(monkeypatch)
+
+    sgy.warmup_course("111", "child-1")
+    sgy.warmup_course("111", "child-1")
+
+    assert sgy._request.call_count == 1
+    (method, url), _kwargs = sgy._request.call_args_list[0]
+    assert method == "GET"
+    assert url == "https://test.schoology.com/course/111/preview/child-1/parent"
+
+
+def test_warmup_course_different_sid_issues_new_get(monkeypatch):
+    sgy = _make_real_sgy(monkeypatch)
+
+    sgy.warmup_course("111", "child-1")
+    sgy.warmup_course("222", "child-1")
+
+    assert sgy._request.call_count == 2
+    urls = [c.args[1] for c in sgy._request.call_args_list]
+    assert urls == [
+        "https://test.schoology.com/course/111/preview/child-1/parent",
+        "https://test.schoology.com/course/222/preview/child-1/parent",
+    ]
+
+
+def test_warmup_course_noop_without_child_uid(monkeypatch):
+    sgy = _make_real_sgy(monkeypatch)
+
+    sgy.warmup_course("111", None)
+    sgy.warmup_course("111", "")
+
+    sgy._request.assert_not_called()
+
+
+def test_warmup_course_noop_without_sid(monkeypatch):
+    sgy = _make_real_sgy(monkeypatch)
+
+    sgy.warmup_course("", "child-1")
+
+    sgy._request.assert_not_called()
+
+
+def test_warmup_course_swallows_request_exception_and_still_marks_warmed(monkeypatch):
+    """A failed warmup GET is non-fatal (matches prior try/except-at-call-site
+    behavior) and must still mark the course warmed so we don't hammer a
+    course that's erroring on every subsequent fetch this session.
+    """
+    from unittest.mock import MagicMock
+    sgy = _make_real_sgy(monkeypatch)
+    sgy._request = MagicMock(side_effect=RuntimeError("boom"))
+
+    sgy.warmup_course("111", "child-1")  # should not raise
+    sgy.warmup_course("111", "child-1")  # second call must still no-op
+
+    assert sgy._request.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# warmup-before-course-fetch ordering
+# ---------------------------------------------------------------------------
+
+def test_scrape_grades_warmup_happens_before_detail_fetch():
+    """scrape_grades must call warmup_course before fetching per-course grade
+    detail — this is the invariant the roadmap flagged as untested.
+    """
+    from unittest.mock import MagicMock, patch
+    from sgy_cli.cli import scrape_grades
+
+    call_order = []
+
+    sgy = MagicMock()
+    sgy.base_url = "https://test.schoology.com"
+    sgy.verbose = False
+    sgy.warnings = []
+    sgy.ensure_logged_in = MagicMock()
+    sgy.switch_to_child = MagicMock()
+    sgy.warmup_course = MagicMock(side_effect=lambda *a, **k: call_order.append("warmup"))
+
+    courses = [{"name": "Math", "grade": "95", "letter": "A", "section_id": "111"}]
+
+    def fake_detail(sgy_arg, sid):
+        call_order.append("detail_fetch")
+        assert sid == "111"
+        return []
+
+    with patch("sgy_cli.cli.get_courses_and_grades", return_value=courses), \
+         patch("sgy_cli.cli._scrape_course_grade_detail", side_effect=fake_detail):
+        scrape_grades(sgy, child={"uid": "child-1"}, detail=True)
+
+    assert call_order == ["warmup", "detail_fetch"]
+    sgy.warmup_course.assert_called_once_with("111", "child-1", context="Math")

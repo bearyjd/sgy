@@ -1,0 +1,36 @@
+{
+  "folder-item": [
+    {
+      "type": "assignment",
+      "id": "1001",
+      "title": "Fake Worksheet 1",
+      "due": "2026-05-01 23:59:00"
+    },
+    {
+      "type": "discussion",
+      "id": "1002",
+      "title": "Fake Discussion Topic",
+      "due": ""
+    },
+    {
+      "type": "quiz",
+      "id": "1003",
+      "title": "Fake Chapter Quiz"
+    },
+    {
+      "type": "page",
+      "id": "1004",
+      "title": "Fake Notes Page"
+    },
+    {
+      "type": "folder",
+      "id": "1005",
+      "title": "Fake Subfolder"
+    },
+    {
+      "type": "assignment",
+      "id": "1006",
+      "title": ""
+    }
+  ]
+}
