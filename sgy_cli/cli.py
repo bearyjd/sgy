@@ -355,6 +355,7 @@ class SchoologySession:
         self._parent_home_soup: Optional[BeautifulSoup] = None
         self._last_request_time = 0.0
         self._folder_cache: dict = {}
+        self._warmed_courses: set = set()
         # Separate session for Google fetches (no Schoology auth cookies)
         self._google_session = requests.Session()
         self._google_session.headers.update({"User-Agent": DEFAULT_UA})
@@ -400,6 +401,29 @@ class SchoologySession:
                 response=r,
             )
         return r
+
+    def warmup_course(self, sid: str, child_uid: Optional[str], context: str = ""):
+        """Warm up a course for parent-account access to /course/{sid}/... URLs.
+
+        Parent accounts get a 403 on /page/{id} and empty results from grades/
+        materials endpoints unless the session first visits
+        /course/{sid}/preview/{child_uid}/parent. One warmup per course per
+        session is sufficient — the server-side auth context persists — so this
+        is a no-op if `sid` was already warmed this session. See
+        NOTES.md#preview-warmup-discovery-key-algorithm and
+        .agent_native/agent_roadmap.md item 2. Any new function that fetches
+        /course/{sid}/... MUST call self.warmup_course(sid, child_uid) first.
+        """
+        if not sid or not child_uid:
+            return
+        if sid in self._warmed_courses:
+            return
+        try:
+            self._request("GET", f"{self.base_url}/course/{sid}/preview/{child_uid}/parent", timeout=15)
+        except Exception as exc:
+            label = f"({context})" if context else ""
+            _log(f"  [warn] preview warmup{label} failed: {exc}", self.verbose)
+        self._warmed_courses.add(sid)
 
     # -- login / session cache --
 
@@ -862,11 +886,7 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
         cname = course.get("name", "")
 
         # Preview warmup — needed for parent accounts to access course-level URLs
-        if child_uid:
-            try:
-                sgy._request("GET", f"{sgy.base_url}/course/{sid}/preview/{child_uid}/parent", timeout=15)
-            except Exception as exc:
-                _log(f"  [warn] preview warmup({cname}) failed: {exc}", sgy.verbose)
+        sgy.warmup_course(sid, child_uid, context=cname)
 
         # Source 4: Folder API — structured list of ALL material types
         try:
@@ -907,12 +927,8 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
         if not sid:
             continue
         cname = course.get("name", "")
-        # Preview warmup for parent accounts
-        if child_uid:
-            try:
-                sgy._request("GET", f"{sgy.base_url}/course/{sid}/preview/{child_uid}/parent", timeout=15)
-            except Exception:
-                pass  # warmup failure is non-fatal; _get_assignments_from_grades handles 403
+        # Preview warmup for parent accounts (no-op if already warmed this session)
+        sgy.warmup_course(sid, child_uid, context=cname)
         try:
             found = _get_assignments_from_grades(sgy, sid)
             for a in found:
@@ -1271,11 +1287,7 @@ def scrape_grades(sgy: SchoologySession, child: Optional[dict], detail: bool = T
             sid = course.get("section_id", "")
             if sid:
                 # Preview warmup — needed for parent accounts to access student_grades
-                if child_uid:
-                    try:
-                        sgy._request("GET", f"{sgy.base_url}/course/{sid}/preview/{child_uid}/parent", timeout=15)
-                    except Exception as exc:
-                        _log(f"  [warn] preview warmup({course['name']}) failed: {exc}", sgy.verbose)
+                sgy.warmup_course(sid, child_uid, context=course["name"])
                 try:
                     detail_items = _scrape_course_grade_detail(sgy, sid)
                     grade_entry["items"] = detail_items
@@ -1402,7 +1414,7 @@ def _discover_page_embeds(sgy: SchoologySession, page_id: str, sid: str, child_u
         return []
 
     _log("    Discovering embeds via preview warmup...", sgy.verbose)
-    sgy._request("GET", f"{sgy.base_url}/course/{sid}/preview/{child_uid}/parent", timeout=15)
+    sgy.warmup_course(sid, child_uid)
 
     r = sgy._request("GET", f"{sgy.base_url}/page/{page_id}", timeout=15)
     if r.status_code != 200:
@@ -1510,11 +1522,7 @@ def _get_page_ids_from_html(sgy: SchoologySession, sid: str, child_uid: Optional
     auth context. Without this, the page may return empty or 403.
     """
     # Preview warmup — needed for parent accounts to access course materials
-    if child_uid:
-        try:
-            sgy._request("GET", f"{sgy.base_url}/course/{sid}/preview/{child_uid}/parent", timeout=15)
-        except Exception as exc:
-            _log(f"  [warn] preview warmup failed: {exc}", sgy.verbose)
+    sgy.warmup_course(sid, child_uid)
 
     params = {}
     if child_uid:
@@ -1546,11 +1554,7 @@ def _fetch_page_content(sgy: SchoologySession, item_id: str, material_type: str 
                         child_uid: str = "") -> dict:
     """Fetch a Schoology page or document link and extract embedded Google content."""
     # Preview warmup — parent accounts need this before accessing course content
-    if child_uid and sid:
-        try:
-            sgy._request("GET", f"{sgy.base_url}/course/{sid}/preview/{child_uid}/parent", timeout=15)
-        except Exception as exc:
-            _log(f"  [warn] content preview warmup failed: {exc}", sgy.verbose)
+    sgy.warmup_course(sid, child_uid)
 
     if material_type == "document" and sid:
         url = f"{sgy.base_url}/course/{sid}/materials/link/view/{item_id}"
