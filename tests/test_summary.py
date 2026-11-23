@@ -264,6 +264,18 @@ def test_parse_date_returns_none_on_garbage():
     assert _parse_date("not a date") is None
 
 
+def test_parse_date_handles_schoology_overdue_word_order():
+    from datetime import datetime, timedelta
+    from unittest.mock import patch
+    from sgy_cli.cli import _parse_date
+
+    now = datetime(2026, 11, 22, 12)
+    with patch("sgy_cli.cli.datetime") as clock:
+        clock.now.return_value = now
+        assert _parse_date("37 days overdue") == (now - timedelta(days=37)).replace(hour=23, minute=59)
+        assert _parse_date("Overdue by 1 day") == (now - timedelta(days=1)).replace(hour=23, minute=59)
+
+
 # ---------------------------------------------------------------------------
 # _parse_upcoming_events normalizes "Due {weekday}, ..." to ISO
 # ---------------------------------------------------------------------------
@@ -302,6 +314,74 @@ def test_upcoming_events_keeps_raw_text_when_unparseable():
     soup = BeautifulSoup(html, "html.parser")
     items = _parse_upcoming_events(soup)
     assert items[0]["due_date"] == "Due whenever"
+
+
+def test_scrape_keeps_widget_reported_older_overdue_assignments():
+    from datetime import datetime
+    from unittest.mock import MagicMock, patch
+    from bs4 import BeautifulSoup
+    from sgy_cli.cli import scrape_assignments
+
+    sgy = MagicMock()
+    sgy.fetch_json.return_value = {"html": """
+    <div class="upcoming-event">
+      <div class="event-title"><a href="/assignment/100">Reading Project</a></div>
+      <div class="readonly-title event-subtitle">37 days overdue</div>
+    </div>
+    """}
+    sgy.fetch_page.return_value = BeautifulSoup("", "html.parser")
+    calendar = [
+        {"title": "Reading Project", "course": "Reading", "due_date": "2026-10-16",
+         "status": "unknown", "link": "https://test.schoology.com/assignment/100"},
+        {"title": "Historical assignment", "course": "Reading", "due_date": "2026-10-16",
+         "status": "unknown", "link": "/assignment/200"},
+    ]
+    with patch("sgy_cli.cli.datetime", wraps=datetime) as clock, \
+         patch("sgy_cli.cli.get_courses_and_grades", return_value=[]), \
+         patch("sgy_cli.cli._scrape_calendar_assignments", return_value=calendar):
+        clock.now.return_value = datetime(2026, 11, 22, 12)
+        items = scrape_assignments(sgy, child={"uid": "1"}, days=14)
+
+    assert items == [calendar[0]]
+
+
+def test_scrape_distinguishes_parent_overdue_and_recently_completed_widgets():
+    from datetime import datetime
+    from unittest.mock import MagicMock, patch
+    from bs4 import BeautifulSoup
+    from sgy_cli.cli import scrape_assignments
+
+    sgy = MagicMock()
+    overdue_endpoint = "/iapi/parent/overdue_submissions/123"
+    sgy.fetch_json.side_effect = lambda path: {
+        overdue_endpoint: {"response_code": 200, "body": {"html": """
+            <div class="upcoming-event">
+              <div class="event-title"><a href="/assignment/100">Gas Law Lab</a></div>
+              <div class="readonly-title event-subtitle">16 days overdue</div>
+              <div class="readonly-title event-subtitle">Physical Science</div>
+            </div>
+        """}},
+    }.get(path)
+    sgy.fetch_page.return_value = BeautifulSoup("""
+        <div class="recently-completed-event">
+          <span class="recently-completed-title"><a href="/assignment/101">States of Matter Lab</a></span>
+        </div>
+    """, "html.parser")
+    calendar = [
+        {"title": "Gas Law Lab", "course": "Physical Science", "due_date": "",
+         "status": "unknown", "link": "https://test.schoology.com/assignment/100"},
+        {"title": "States of Matter Lab", "course": "Physical Science", "due_date": "2026-11-20",
+         "status": "unknown", "link": "/assignment/101"},
+    ]
+    with patch("sgy_cli.cli.datetime", wraps=datetime) as clock, \
+         patch("sgy_cli.cli.get_courses_and_grades", return_value=[]), \
+         patch("sgy_cli.cli._scrape_calendar_assignments", return_value=calendar):
+        clock.now.return_value = datetime(2026, 11, 22, 12)
+        items = {a["title"]: a for a in scrape_assignments(sgy, child={"uid": "123"}, days=14)}
+
+    assert items["Gas Law Lab"]["status"] == "overdue"
+    assert items["Gas Law Lab"]["due_date"] == "2026-11-06"
+    assert items["States of Matter Lab"]["status"] == "completed"
 
 
 # ---------------------------------------------------------------------------

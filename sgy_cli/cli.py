@@ -170,6 +170,13 @@ def load_session() -> Optional[dict]:
     return data.get("cookies")
 
 
+def _overdue_days(date_text: str) -> Optional[int]:
+    match = re.search(r"\boverdue\s+by\s+(\d+)\s+days?\b", date_text, re.IGNORECASE)
+    if not match:
+        match = re.search(r"\b(\d+)\s+days?\s+overdue\b", date_text, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
 def _parse_date(date_str: str) -> Optional[datetime]:
     """Try multiple date formats commonly used by Schoology.
 
@@ -196,10 +203,10 @@ def _parse_date(date_str: str) -> Optional[datetime]:
     if m_in:
         return (now + timedelta(days=int(m_in.group(1)))).replace(hour=23, minute=59, second=0, microsecond=0)
 
-    # "Overdue by 2 days"
-    m_overdue = re.search(r"overdue\s+by\s+(\d+)\s+day", lower)
-    if m_overdue:
-        return (now - timedelta(days=int(m_overdue.group(1)))).replace(hour=23, minute=59, second=0, microsecond=0)
+    # "Overdue by 2 days" / "37 days overdue"
+    overdue_days = _overdue_days(lower)
+    if overdue_days is not None:
+        return (now - timedelta(days=overdue_days)).replace(hour=23, minute=59, second=0, microsecond=0)
 
     # "2 days ago"
     m_ago = re.search(r"(\d+)\s+days?\s+ago", lower)
@@ -716,6 +723,16 @@ def get_courses_and_grades(sgy: SchoologySession, child: Optional[dict] = None) 
 # Assignments scraper
 # ---------------------------------------------------------------------------
 
+def _assignment_key(a: dict) -> str:
+    link = a.get("link", "").strip().rstrip("/")
+    if link:
+        link = re.sub(r"^https?://[^/]+", "", link)
+        return f"link:{link}"
+    title = re.sub(r"\s+", " ", a.get("title", "").strip().lower())
+    course = re.sub(r"\s+", " ", a.get("course", "").strip().lower())
+    return f"tc:{title}|{course}"
+
+
 def _dedup_assignments(items: list) -> list:
     """Deduplicate assignments by normalized title+course or by link.
 
@@ -723,16 +740,6 @@ def _dedup_assignments(items: list) -> list:
     folder API, grades page) we keep the richest version — the one with the
     most non-empty fields.
     """
-    def _key(a: dict) -> str:
-        link = a.get("link", "").strip().rstrip("/")
-        if link:
-            # Normalize to just the path portion
-            link = re.sub(r"^https?://[^/]+", "", link)
-            return f"link:{link}"
-        title = re.sub(r"\s+", " ", a.get("title", "").strip().lower())
-        course = re.sub(r"\s+", " ", a.get("course", "").strip().lower())
-        return f"tc:{title}|{course}"
-
     def _richness(a: dict) -> int:
         """Score how many useful fields this record has."""
         score = 0
@@ -744,7 +751,7 @@ def _dedup_assignments(items: list) -> list:
 
     best: dict = {}  # key -> assignment
     for a in items:
-        k = _key(a)
+        k = _assignment_key(a)
         if k not in best or _richness(a) > _richness(best[k]):
             best[k] = a
     return list(best.values())
@@ -814,13 +821,14 @@ def _enrich_event_dates(sgy: "SchoologySession", items: list) -> int:
 def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int = 14) -> list:
     """Scrape upcoming/overdue assignments for a child.
 
-    Runs ALL sources and merges results (no short-circuiting):
+    Runs all sources and merges results:
       1. AJAX upcoming submissions endpoint
       2. Home page upcoming events widget
       3. Calendar feed (AJAX + iCal)
       4. Folder API per-course (/v1/courses/{sid}/folder/0)
       5. Course materials HTML scrape
       6. Grades page cross-reference (catches graded items not listed elsewhere)
+      7. Parent dashboard overdue widget
 
     Results are deduplicated by title+course or link, keeping the richest record.
     """
@@ -830,6 +838,8 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
 
     all_items: list = []
     source_counts: dict = {}
+    completed_keys = set()
+    overdue_items = {}
 
     # --- Source 1: AJAX upcoming submissions endpoint ---
     try:
@@ -850,6 +860,11 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
         found = _parse_upcoming_events(soup)
         all_items.extend(found)
         source_counts["home_widget"] = len(found)
+        completed_keys = {
+            _assignment_key({"link": anchor["href"]})
+            for anchor in soup.select(".recently-completed-event .recently-completed-title a[href]")
+            if anchor["href"].strip()
+        }
     except Exception as exc:
         _log(f"  [warn] home_widget failed: {exc}", sgy.verbose)
         sgy.warnings.append(f"home_widget: {exc}")
@@ -941,14 +956,49 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
             continue
     source_counts["grades_xref"] = grades_count
 
+    if child_uid:
+        try:
+            data = sgy.fetch_json(f"/iapi/parent/overdue_submissions/{child_uid}")
+            if not isinstance(data, dict) or not isinstance(data.get("body"), dict):
+                raise ValueError("unexpected response")
+            html = data["body"].get("html")
+            if not isinstance(html, str):
+                raise ValueError("missing widget HTML")
+            overdue_items = {
+                _assignment_key(a): a for a in _parse_upcoming_events(BeautifulSoup(html, "html.parser"))
+            }
+            all_items.extend(overdue_items.values())
+            source_counts["parent_overdue"] = len(overdue_items)
+        except Exception as exc:
+            _log(f"  [warn] parent_overdue failed: {exc}", sgy.verbose)
+            sgy.warnings.append(f"parent_overdue: {exc}")
+
     # --- Enrich: fill missing due_dates from v1 events API or profile page ---
     enrich_count = _enrich_event_dates(sgy, all_items)
     if enrich_count:
         source_counts["event_enrich"] = enrich_count
 
     # --- Deduplicate ---
+    reported_overdue = {
+        _assignment_key(a) for a in all_items
+        if a.pop("_reported_overdue", False)
+        or str(a.get("status") or "").strip().lower() == "overdue"
+    }
     before_dedup = len(all_items)
     assignments = _dedup_assignments(all_items)
+    for assignment in assignments:
+        key = _assignment_key(assignment)
+        if key in overdue_items:
+            assignment["status"] = "overdue"
+            for field in ("title", "course", "link"):
+                if not assignment.get(field):
+                    assignment[field] = overdue_items[key][field]
+            if not _parse_date(assignment.get("due_date", "")):
+                assignment["due_date"] = overdue_items[key]["due_date"]
+            reported_overdue.add(key)
+        elif key in completed_keys:
+            assignment["status"] = "completed"
+            reported_overdue.discard(key)
 
     # --- Filter by date window ---
     if days and assignments:
@@ -959,7 +1009,9 @@ def scrape_assignments(sgy: SchoologySession, child: Optional[dict], days: int =
         for a in assignments:
             dt = _parse_date(a.get("due_date", ""))
             if dt:
-                if cutoff_past <= dt <= cutoff_future:
+                if dt <= cutoff_future and (
+                    dt >= cutoff_past or _assignment_key(a) in reported_overdue
+                ):
                     filtered.append(a)
             else:
                 # Keep items with no parseable date (better to show than to hide)
@@ -1184,10 +1236,12 @@ def _parse_upcoming_events(soup: BeautifulSoup) -> list:
         subtitles = event.select(".readonly-title.event-subtitle")
         due = subtitles[0].get_text(strip=True) if subtitles else ""
         course = subtitles[-1].get_text(strip=True) if len(subtitles) > 1 else ""
+        reported_overdue = _overdue_days(due) is not None
 
         time_el = event.select_one("time, .event-date")
         if time_el:
             due = time_el.get("datetime", "") or time_el.get_text(strip=True) or due
+            reported_overdue = reported_overdue or _overdue_days(due) is not None
 
         # Schoology renders due text as "Due Friday, May 8, 2026 at 11:59 PM" or
         # similar. Strip the leading prefix and normalize to ISO when parseable
@@ -1203,13 +1257,16 @@ def _parse_upcoming_events(soup: BeautifulSoup) -> list:
         if status_el:
             status = status_el.get_text(strip=True)
 
-        results.append({
+        assignment = {
             "title": title,
             "course": course,
             "due_date": due,
             "status": status,
             "link": link,
-        })
+        }
+        if reported_overdue:
+            assignment["_reported_overdue"] = True
+        results.append(assignment)
 
     # Fallback: broader selectors for the upcoming widget
     if not results:
